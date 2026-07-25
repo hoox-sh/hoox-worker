@@ -33,7 +33,10 @@ import {
   type ProcessRequestBody,
   type WorkerInfo,
 } from "@jango-blockchained/hoox-shared/types";
-import { trackAnalytics } from "@jango-blockchained/hoox-shared/analytics";
+import {
+  trackAnalytics,
+  type AnalyticsEnv,
+} from "@jango-blockchained/hoox-shared/analytics";
 import { healthCheck } from "@jango-blockchained/hoox-shared/health";
 import { KVKeys } from "@jango-blockchained/hoox-shared/kvKeys";
 import { serviceFetch } from "@jango-blockchained/hoox-shared/service-bindings";
@@ -48,10 +51,12 @@ const RATE_LIMIT_WINDOW = 60; // 60 seconds
 
 // --- Type Definitions ---
 
-interface Env extends Cloudflare.Env, AnalyticsEnv {
-  [key: string]: unknown;
-  TELEGRAM_SERVICE?: Fetcher;
-}
+/**
+ * Worker env is the wrangler-generated Cloudflare.Env surface.
+ * Optional secrets used by operator routes (OPERATOR_API_KEY) are read
+ * dynamically so we do not fight generated required bindings.
+ */
+interface Env extends Cloudflare.Env {}
 
 // --- Other interfaces (WebhookData, TradeData, etc.) remain the same ---
 // ... existing interfaces ...
@@ -442,7 +447,7 @@ async function handleRequest(
     // Track webhook API call (non-blocking)
     const latencyMs = Date.now() - startTime;
     ctx.waitUntil(
-      trackAnalytics(env, "/track/api-call", {
+      trackAnalytics(env as AnalyticsEnv, "/track/api-call", {
         worker: "hoox",
         endpoint: "/webhook",
         latencyMs,

@@ -19,5 +19,5 @@
     "ignoreDeprecations": "5.0"
   },
   "include": ["src/**/*", "worker-configuration.d.ts"],
-  "exclude": ["node_modules", "dist", "test"]
+  "exclude": ["node_modules", "dist", "test", "src/**/*.test.ts"]
 }
