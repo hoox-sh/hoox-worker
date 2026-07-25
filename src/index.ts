@@ -22,6 +22,7 @@ import {
   withRequestLog,
   validateJson,
   requireInternalAuth,
+  requireOperatorAuth,
   timingSafeEqual,
 } from "@jango-blockchained/hoox-shared/middleware";
 import { createRouter } from "@jango-blockchained/hoox-shared/router";
@@ -30,6 +31,7 @@ import {
   type WebhookPayload,
   type StandardResponse,
   type ProcessRequestBody,
+  type WorkerInfo,
 } from "@jango-blockchained/hoox-shared/types";
 import { trackAnalytics } from "@jango-blockchained/hoox-shared/analytics";
 import { healthCheck } from "@jango-blockchained/hoox-shared/health";
@@ -184,6 +186,87 @@ router.get(
   }
 );
 
+// ─── Operator management plane (/v1/*) — Bearer OPERATOR_API_KEY ─────────────
+// Prefer a dedicated mgmt hostname + Cloudflare Access in front of these routes.
+// TradingView /webhook remains separate (body apiKey + IP allowlist).
+
+router.get(
+  "/v1/health",
+  async (request: Request, env: Env, _ctx: ExecutionContext) => {
+    const denied = await requireOperatorAuth(request, env);
+    if (denied) return wrapResponse(denied);
+    return wrapResponse(
+      createJsonResponse({
+        success: true,
+        result: {
+          status: "ok",
+          plane: "operator",
+          worker: "hoox",
+          timestamp: new Date().toISOString(),
+        },
+      })
+    );
+  }
+);
+
+router.get(
+  "/v1/workers",
+  async (request: Request, env: Env, _ctx: ExecutionContext) => {
+    const denied = await requireOperatorAuth(request, env);
+    if (denied) return wrapResponse(denied);
+    // Minimal gateway self-view; extended fleet discovery is a later iteration.
+    const workers: WorkerInfo[] = [
+      {
+        id: "hoox",
+        name: "hoox",
+        status: "operational",
+        uptime: 0,
+        cpu: 0,
+        memory: 0,
+        requests: 0,
+        durableObjectCount: 0,
+        edgeCount: 0,
+        version: "operator-v1",
+      },
+    ];
+    return wrapResponse(
+      new Response(JSON.stringify(workers), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+  }
+);
+
+router.get(
+  "/v1/trades/stream",
+  async (request: Request, env: Env, _ctx: ExecutionContext) => {
+    const denied = await requireOperatorAuth(request, env);
+    if (denied) return wrapResponse(denied);
+    return wrapResponse(createOperatorSseStub("trades"));
+  }
+);
+
+router.get(
+  "/v1/logs/stream",
+  async (request: Request, env: Env, _ctx: ExecutionContext) => {
+    const denied = await requireOperatorAuth(request, env);
+    if (denied) return wrapResponse(denied);
+    return wrapResponse(createOperatorSseStub("logs"));
+  }
+);
+
+/** Legacy unversioned aliases (same auth) for older clients. */
+router.get(
+  "/workers",
+  async (request: Request, env: Env, ctx: ExecutionContext) => {
+    // Reuse /v1/workers handler by internal redirect-style call
+    const url = new URL(request.url);
+    url.pathname = "/v1/workers";
+    return router.handle(new Request(url, request), env, ctx);
+  }
+);
+
 export default {
   fetch: withRequestLog(
     (request: Request, env: Env, ctx: ExecutionContext) => {
@@ -192,6 +275,34 @@ export default {
     { service: "hoox-gateway", module: "router" }
   ),
 };
+
+/**
+ * Minimal SSE stub so remote TUI can open a stream after auth.
+ * Emits one connected event then closes (client may reconnect).
+ */
+function createOperatorSseStub(stream: "trades" | "logs"): Response {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const payload = JSON.stringify({
+        type: "connected",
+        stream,
+        ts: Date.now(),
+      });
+      controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
+      controller.enqueue(encoder.encode(`: operator-stream-stub\n\n`));
+      controller.close();
+    },
+  });
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
+}
 
 // --- Request Handling Logic ---
 

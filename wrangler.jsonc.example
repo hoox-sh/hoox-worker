@@ -34,6 +34,10 @@
     // INTERNAL_KEY: Service-to-service authentication
     // Set via: wrangler secret put INTERNAL_KEY_BINDING
     "INTERNAL_KEY_BINDING": null,
+    // OPERATOR_API_KEY: Bearer secret for management plane (/v1/*)
+    // Client: HOOX_API_TOKEN must match this value
+    // Set via: wrangler secret put OPERATOR_API_KEY
+    // "OPERATOR_API_KEY": null,
     // HA_TOKEN: Home Assistant access token (optional)
     // Set via: wrangler secret put HA_TOKEN_BINDING
     "HA_TOKEN_BINDING": null,

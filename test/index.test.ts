@@ -21,6 +21,8 @@ function createMockContext(): ExecutionContext {
 interface MockEnv {
   WEBHOOK_API_KEY_BINDING?: string;
   INTERNAL_KEY_BINDING?: string;
+  OPERATOR_API_KEY?: string;
+  INTERNAL_API_KEY?: string;
   CONFIG_KV?: any;
   SESSIONS_KV?: any;
   TRADE_SERVICE?: any;
@@ -56,6 +58,7 @@ function createMockEnv(overrides: Partial<MockEnv> = {}): MockEnv {
   return {
     WEBHOOK_API_KEY_BINDING: "test-api-key",
     INTERNAL_KEY_BINDING: "test-internal-key",
+    OPERATOR_API_KEY: "test-operator-key",
     CONFIG_KV: createMockKV(),
     SESSIONS_KV: createMockKV(),
     TRADE_SERVICE: createMockServiceBinding(),
@@ -72,6 +75,137 @@ function createMockEnv(overrides: Partial<MockEnv> = {}): MockEnv {
     ...overrides,
   };
 }
+
+function operatorAuthHeaders(
+  token = "test-operator-key"
+): Record<string, string> {
+  return { Authorization: `Bearer ${token}` };
+}
+
+// ============================================================================
+// Operator management plane (/v1/*)
+// ============================================================================
+
+describe("Hoox Worker - Operator /v1 routes", () => {
+  it("GET /v1/health requires Bearer auth", async () => {
+    const env = createMockEnv();
+    const bare = new Request("https://example.com/v1/health", {
+      method: "GET",
+    });
+    const denied = await webhookReceiver.fetch(
+      bare,
+      env as any,
+      createMockContext()
+    );
+    expect(denied.status).toBe(401);
+
+    const okReq = new Request("https://example.com/v1/health", {
+      method: "GET",
+      headers: operatorAuthHeaders(),
+    });
+    const ok = await webhookReceiver.fetch(
+      okReq,
+      env as any,
+      createMockContext()
+    );
+    expect(ok.status).toBe(200);
+    const body = (await ok.json()) as {
+      success: boolean;
+      result: { plane: string };
+    };
+    expect(body.success).toBe(true);
+    expect(body.result.plane).toBe("operator");
+  });
+
+  it("GET /v1/workers returns WorkerInfo array when authorized", async () => {
+    const env = createMockEnv();
+    const request = new Request("https://example.com/v1/workers", {
+      method: "GET",
+      headers: operatorAuthHeaders(),
+    });
+    const response = await webhookReceiver.fetch(
+      request,
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(200);
+    const workers = (await response.json()) as Array<{ id: string }>;
+    expect(Array.isArray(workers)).toBe(true);
+    expect(workers[0]?.id).toBe("hoox");
+  });
+
+  it("GET /v1/workers rejects wrong token", async () => {
+    const env = createMockEnv();
+    const request = new Request("https://example.com/v1/workers", {
+      method: "GET",
+      headers: operatorAuthHeaders("wrong"),
+    });
+    const response = await webhookReceiver.fetch(
+      request,
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(401);
+  });
+
+  it("GET /v1/trades/stream returns event-stream when authorized", async () => {
+    const env = createMockEnv();
+    const request = new Request("https://example.com/v1/trades/stream", {
+      method: "GET",
+      headers: operatorAuthHeaders(),
+    });
+    const response = await webhookReceiver.fetch(
+      request,
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type") ?? "").toContain(
+      "text/event-stream"
+    );
+    const text = await response.text();
+    expect(text).toContain("data:");
+    expect(text).toContain("trades");
+  });
+
+  it("GET /workers alias requires auth", async () => {
+    const env = createMockEnv();
+    const denied = await webhookReceiver.fetch(
+      new Request("https://example.com/workers", { method: "GET" }),
+      env as any,
+      createMockContext()
+    );
+    expect(denied.status).toBe(401);
+
+    const ok = await webhookReceiver.fetch(
+      new Request("https://example.com/workers", {
+        method: "GET",
+        headers: operatorAuthHeaders(),
+      }),
+      env as any,
+      createMockContext()
+    );
+    expect(ok.status).toBe(200);
+  });
+
+  it("fails closed when OPERATOR_API_KEY missing", async () => {
+    const env = createMockEnv({
+      OPERATOR_API_KEY: undefined,
+      INTERNAL_API_KEY: undefined,
+    });
+    delete env.OPERATOR_API_KEY;
+    delete env.INTERNAL_API_KEY;
+    const response = await webhookReceiver.fetch(
+      new Request("https://example.com/v1/workers", {
+        method: "GET",
+        headers: operatorAuthHeaders("anything"),
+      }),
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(401);
+  });
+});
 
 // ============================================================================
 // Health Check Endpoint Tests
