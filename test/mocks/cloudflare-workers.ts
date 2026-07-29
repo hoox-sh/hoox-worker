@@ -1,4 +1,9 @@
 /**
+ * Copyright (c) 2026 HOOX · HOOX · jango-blockchained
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
  * Mock for `cloudflare:workers` — workerd runtime module.
  * Provides the `DurableObject` base class for testing environments (bun test)
  * where the workerd runtime is not available.

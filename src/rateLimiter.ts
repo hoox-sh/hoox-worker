@@ -1,4 +1,9 @@
 /**
+ * Copyright (c) 2026 HOOX · HOOX · jango-blockchained
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
  * Rate limiter with optional KV persistence.
  *
  * Falls back to in-memory Map when KV is unavailable (cold start / local dev).

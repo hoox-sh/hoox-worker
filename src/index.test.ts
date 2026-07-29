@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 HOOX · HOOX · jango-blockchained
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 import { describe, it, expect, mock } from "bun:test";
 import webhookReceiver from "./index";
 import type { ExecutionContext } from "@cloudflare/workers-types";

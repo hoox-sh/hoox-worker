@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 HOOX · HOOX · jango-blockchained
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 declare module "bun:test" {
   export const expect: typeof import("bun:test").expect;
   export const test: (...args: any[]) => any;

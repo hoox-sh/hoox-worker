@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 HOOX · HOOX · jango-blockchained
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 import { DurableObject } from "cloudflare:workers";
 
 const DEFAULT_TTL_MS = 300_000; // 5 minutes

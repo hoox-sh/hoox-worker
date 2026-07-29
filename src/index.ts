@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 HOOX · HOOX · jango-blockchained
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 // hoox/src/index.ts - Public-facing gateway for TradingView
 
 import type {
@@ -69,6 +74,8 @@ interface WebhookData {
   quantity: number;
   price?: number;
   leverage?: number;
+  /** When true, execute against exchange testnet/sandbox (if supported). */
+  test?: boolean;
   notify?: {
     message?: string;
     chatId: string;
@@ -83,6 +90,8 @@ interface TradeData {
   quantity: number;
   price?: number;
   leverage?: number;
+  /** When true, execute against exchange testnet/sandbox (if supported). */
+  test?: boolean;
 }
 
 interface NotificationData {
@@ -372,7 +381,7 @@ async function handleRequest(
     let overallSuccess = true; // Track overall status
     const errorMessages: string[] = [];
 
-    const { exchange, action, symbol, quantity, price, leverage, notify } =
+    const { exchange, action, symbol, quantity, price, leverage, test, notify } =
       data;
 
     // Process trading signal if present
@@ -387,6 +396,7 @@ async function handleRequest(
         quantity,
         price,
         leverage,
+        test,
       };
       const validation = validateJson(WebhookPayloadSchema, tradePayload);
       if (!validation.ok) {
@@ -409,6 +419,7 @@ async function handleRequest(
           quantity,
           price,
           leverage,
+          test,
         },
         env,
         queueMode
@@ -548,7 +559,10 @@ async function getQueueMode(
  * Generate idempotency key for a trade
  */
 function generateIdempotencyKey(tradeData: TradeData): string {
-  return `trade:${tradeData.exchange}:${tradeData.symbol}:${tradeData.action}:${tradeData.quantity}`;
+  // Include test mode so a live fill and a testnet fill with the same
+  // size/symbol do not dedupe each other.
+  const mode = tradeData.test === true ? "test" : "live";
+  return `trade:${tradeData.exchange}:${tradeData.symbol}:${tradeData.action}:${tradeData.quantity}:${mode}`;
 }
 
 /**
@@ -595,6 +609,7 @@ async function sendTradeToQueue(
     quantity: tradeData.quantity,
     price: tradeData.price,
     leverage: tradeData.leverage,
+    test: tradeData.test,
     queuedAt: new Date().toISOString(),
   };
   await queue.send(message);
@@ -607,8 +622,16 @@ async function processTrade(
   env: Env,
   queueMode: "queue_everywhere" | "queue_failover" = "queue_failover"
 ): Promise<ServiceResponse> {
-  const { requestId, exchange, action, symbol, quantity, price, leverage } =
-    tradeData;
+  const {
+    requestId,
+    exchange,
+    action,
+    symbol,
+    quantity,
+    price,
+    leverage,
+    test,
+  } = tradeData;
   logger.info(`[${requestId}] processTrade: Received trade data`, {
     tradeData,
   });
@@ -680,6 +703,7 @@ async function processTrade(
       quantity: quantity,
       price: price,
       leverage: leverage,
+      test: test,
     };
 
     const internalAuthKey = env.INTERNAL_KEY_BINDING;
