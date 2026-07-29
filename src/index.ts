@@ -61,7 +61,7 @@ const RATE_LIMIT_WINDOW = 60; // 60 seconds
  * Optional secrets used by operator routes (OPERATOR_API_KEY) are read
  * dynamically so we do not fight generated required bindings.
  */
-interface Env extends Cloudflare.Env {}
+type Env = Cloudflare.Env;
 
 // --- Other interfaces (WebhookData, TradeData, etc.) remain the same ---
 // ... existing interfaces ...
@@ -381,8 +381,16 @@ async function handleRequest(
     let overallSuccess = true; // Track overall status
     const errorMessages: string[] = [];
 
-    const { exchange, action, symbol, quantity, price, leverage, test, notify } =
-      data;
+    const {
+      exchange,
+      action,
+      symbol,
+      quantity,
+      price,
+      leverage,
+      test,
+      notify,
+    } = data;
 
     // Process trading signal if present
     let tradeResult: ServiceResponse | null = null;
