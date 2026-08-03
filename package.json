@@ -1,7 +1,7 @@
 {
   "name": "hoox",
   "version": "1.0.0",
-  "description": "Public webhook endpoint for TradingView signals",
+  "description": "HOOX public gateway worker: TradingView webhooks, WAF/IP allowlist, rate limits, Durable Object idempotency, Service Binding dispatch to trade/telegram/analytics.",
   "main": "src/index.ts",
   "type": "module",
   "license": "Apache-2.0",
@@ -22,5 +22,9 @@
     "bun-types": "^1.3.14",
     "typescript": "^5.9.3",
     "wrangler": "^4.95.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hoox-sh/hoox-worker.git"
   }
 }
