@@ -1,10 +1,10 @@
 /**
- * Copyright (c) 2026 HOOX · HOOX · jango-blockchained
+ * Copyright (c) 2026 HOOX · HOOX · jango-blockchained (hoox-sh)
  * SPDX-License-Identifier: Apache-2.0
  */
 
 import type { KVNamespace } from "@cloudflare/workers-types";
-import { createLogger } from "@jango-blockchained/hoox-shared/middleware";
+import { createLogger } from "@hoox-sh/hoox-shared/middleware";
 
 const logger = createLogger({ service: "hoox", module: "ipAllowlist" });
 
