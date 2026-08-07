@@ -25,15 +25,30 @@ describe("killSwitch", () => {
     expect(result.enabled).toBe(false);
   });
 
-  test("returns enabled: true when KV returns 'true'", async () => {
-    mockGet.mockResolvedValue("true");
+  test("returns enabled: true when trade:kill_switch is true", async () => {
+    mockGet.mockImplementation(async (key: string) =>
+      key === "trade:kill_switch" ? "true" : null
+    );
     const kv = { get: mockGet } as any;
     const result = await checkKillSwitch(kv);
     expect(result.enabled).toBe(true);
+    expect(result.source).toBe("trade:kill_switch");
+  });
+
+  test("returns enabled: true when global:kill_switch is true", async () => {
+    mockGet.mockImplementation(async (key: string) =>
+      key === "global:kill_switch" ? "true" : null
+    );
+    const kv = { get: mockGet } as any;
+    const result = await checkKillSwitch(kv);
+    expect(result.enabled).toBe(true);
+    expect(result.source).toBe("global:kill_switch");
   });
 
   test("returns enabled: true when KV returns 'TRUE' (case insensitive)", async () => {
-    mockGet.mockResolvedValue("TRUE");
+    mockGet.mockImplementation(async (key: string) =>
+      key === "trade:kill_switch" ? "TRUE" : null
+    );
     const kv = { get: mockGet } as any;
     const result = await checkKillSwitch(kv);
     expect(result.enabled).toBe(true);

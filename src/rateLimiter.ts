@@ -10,6 +10,8 @@
  * KV-backed mode survives cold starts and shares state across all worker instances.
  */
 
+import type { KVNamespace } from "@cloudflare/workers-types";
+
 const DEFAULT_MAX_REQUESTS = 10;
 const DEFAULT_WINDOW_SECONDS = 60;
 const KV_PREFIX = "ratelimit:";

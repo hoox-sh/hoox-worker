@@ -26,7 +26,6 @@ import {
   createLogger,
   withRequestLog,
   validateJson,
-  requireInternalAuth,
   requireOperatorAuth,
   timingSafeEqual,
 } from "@hoox-sh/hoox-shared/middleware";
@@ -42,7 +41,6 @@ import {
   trackAnalytics,
   type AnalyticsEnv,
 } from "@hoox-sh/hoox-shared/analytics";
-import { healthCheck } from "@hoox-sh/hoox-shared/health";
 import { KVKeys } from "@hoox-sh/hoox-shared/kvKeys";
 import { serviceFetch } from "@hoox-sh/hoox-shared/service-bindings";
 import {
@@ -53,6 +51,10 @@ import {
 // --- Rate limiting limits (passed to KV-backed rate limiter) ---
 const MAX_TRADES_PER_MINUTE = 10;
 const RATE_LIMIT_WINDOW = 60; // 60 seconds
+
+// TradingView / webhook payloads are small; keep a tight hard cap.
+const MAX_JSON_BODY_BYTES = 64 * 1024; // 64 KiB
+const MAX_IDEMPOTENCY_KEY_LEN = 256;
 
 // --- Type Definitions ---
 
@@ -68,17 +70,19 @@ type Env = Cloudflare.Env;
 interface WebhookData {
   apiKey?: string;
   signal?: string;
-  exchange: string;
-  action: string;
-  symbol: string;
-  quantity: number;
+  exchange?: string;
+  action?: string;
+  symbol?: string;
+  quantity?: number;
   price?: number;
   leverage?: number;
   /** When true, execute against exchange testnet/sandbox (if supported). */
   test?: boolean;
+  /** Optional client-supplied idempotency key (body or Idempotency-Key header). */
+  idempotencyKey?: string;
   notify?: {
     message?: string;
-    chatId: string;
+    chatId: string | number;
   };
 }
 
@@ -92,12 +96,14 @@ interface TradeData {
   leverage?: number;
   /** When true, execute against exchange testnet/sandbox (if supported). */
   test?: boolean;
+  /** Resolved idempotency key (client-provided or generated). */
+  idempotencyKey?: string;
 }
 
 interface NotificationData {
   requestId: string;
   message: string;
-  chatId: string;
+  chatId: string | number;
 }
 
 interface ServiceResponse {
@@ -184,19 +190,37 @@ const logger = createLogger({ service: "hoox-gateway", module: "router" });
 
 const router = createRouter<Env>();
 
-// Define routes
-router.post(
-  "/webhook",
-  async (request: Request, env: Env, ctx: ExecutionContext) => {
-    return await handleRequest(request, env, ctx);
-  }
-);
+// Define routes — POST / and POST /webhook are the public signal ingress
+const handleWebhook = async (
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext
+) => handleRequest(request, env, ctx);
+
+router.post("/webhook", handleWebhook);
+router.post("/", handleWebhook);
 
 router.get(
   "/health",
-  async (request: Request, env: Env, ctx: ExecutionContext) => {
-    const response = healthCheck({ worker: "hoox" });
-    return wrapResponse(response);
+  async (_request: Request, env: Env, _ctx: ExecutionContext) => {
+    // Liveness probe: no auth, no KV round-trips — only report binding presence.
+    const bindings = {
+      kv: env.CONFIG_KV ? "configured" : "missing",
+      sessions: env.SESSIONS_KV ? "configured" : "missing",
+      queue: env.TRADE_QUEUE ? "configured" : "missing",
+      trade: env.TRADE_SERVICE ? "configured" : "missing",
+      telegram: env.TELEGRAM_SERVICE ? "configured" : "missing",
+      idempotency: env.IDEMPOTENCY_STORE ? "configured" : "missing",
+    };
+    return wrapResponse(
+      createJsonResponse({
+        success: true,
+        status: "ok",
+        timestamp: Date.now(),
+        service: "hoox",
+        bindings,
+      })
+    );
   }
 );
 
@@ -320,6 +344,107 @@ function createOperatorSseStub(stream: "trades" | "logs"): Response {
 
 // --- Request Handling Logic ---
 
+/**
+ * Early Content-Length reject (does not trust the header alone for the hard
+ * cap — see `readJsonBodyWithLimit`).
+ */
+function rejectOversizedContentLength(request: Request): Response | null {
+  const contentLength = request.headers.get("Content-Length");
+  if (!contentLength) return null;
+  const size = Number.parseInt(contentLength, 10);
+  if (Number.isNaN(size) || size < 0 || size > MAX_JSON_BODY_BYTES) {
+    return wrapResponse(
+      createJsonResponse(
+        {
+          success: false,
+          error: `Request body too large (max ${MAX_JSON_BODY_BYTES} bytes)`,
+        },
+        413
+      )
+    );
+  }
+  return null;
+}
+
+/**
+ * Parse JSON body with a hard byte cap (does not trust Content-Length alone).
+ */
+async function readJsonBodyWithLimit(
+  request: Request,
+  maxBytes: number = MAX_JSON_BODY_BYTES
+): Promise<
+  | { ok: true; value: unknown }
+  | { ok: false; status: number; error: string }
+> {
+  const reader = request.body?.getReader();
+  if (!reader) {
+    return { ok: false, status: 400, error: "Empty request body" };
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+          /* ignore cancel errors */
+        }
+        return {
+          ok: false,
+          status: 413,
+          error: `Request body too large (max ${maxBytes} bytes)`,
+        };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return { ok: false, status: 400, error: "Failed to read request body" };
+  }
+
+  if (total === 0) {
+    return { ok: false, status: 400, error: "Empty request body" };
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(merged);
+    return { ok: true, value: JSON.parse(text) as unknown };
+  } catch {
+    return { ok: false, status: 400, error: "Invalid JSON in request body" };
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * True when the payload appears to request trade execution.
+ * Empty-string placeholders (common in notify-only clients) do not count.
+ * Any non-empty exchange/action/symbol triggers full Zod validation
+ * (so zero/negative quantity still 400 when paired with real fields).
+ */
+function hasTradeIntent(data: WebhookData): boolean {
+  const hasExchange =
+    typeof data.exchange === "string" && data.exchange.trim().length > 0;
+  const hasAction =
+    typeof data.action === "string" && data.action.trim().length > 0;
+  const hasSymbol =
+    typeof data.symbol === "string" && data.symbol.trim().length > 0;
+  return hasExchange || hasAction || hasSymbol;
+}
+
 async function handleRequest(
   request: Request,
   env: Env,
@@ -334,35 +459,72 @@ async function handleRequest(
     return wrapResponse(new Response("Method not allowed", { status: 405 }));
   }
 
-  // Check IP allowlist (TradingView IP restriction)
+  const oversized = rejectOversizedContentLength(request);
+  if (oversized) return oversized;
+
   const clientIp = request.headers.get("CF-Connecting-IP") || "";
-  const ipCheck = await checkIpAllowlist(env.CONFIG_KV, clientIp);
-  if (!ipCheck.allowed) {
-    logger.warn(`[handleRequest] IP ${clientIp} rejected: ${ipCheck.reason}`);
+
+  // Kill switch + IP allowlist in parallel (both read CONFIG_KV)
+  const [killSwitch, ipCheck] = await Promise.all([
+    checkKillSwitch(env.CONFIG_KV),
+    checkIpAllowlist(env.CONFIG_KV, clientIp),
+  ]);
+
+  if (killSwitch.enabled) {
+    logger.warn(
+      `[handleRequest] Kill switch active (source=${killSwitch.source ?? "unknown"}); rejecting signal`
+    );
     return wrapResponse(
       createJsonResponse(
-        { success: false, error: `Access denied: ${ipCheck.reason}` },
-        403
+        {
+          success: false,
+          error: "Trading paused: global kill switch is enabled",
+          code: "KILL_SWITCH",
+        },
+        503
       )
     );
   }
 
-  try {
-    const data: WebhookData = await request.json();
+  if (!ipCheck.allowed) {
+    // Do not echo the full reason with raw IP internals beyond necessary ops logs
+    logger.warn(`[handleRequest] IP rejected: ${ipCheck.reason}`);
+    return wrapResponse(
+      createJsonResponse({ success: false, error: "Access denied" }, 403)
+    );
+  }
 
-    // Validate the API key using the secret binding
+  try {
+    const parsed = await readJsonBodyWithLimit(request);
+    if (!parsed.ok) {
+      return wrapResponse(
+        createJsonResponse(
+          { success: false, error: parsed.error },
+          parsed.status
+        )
+      );
+    }
+    if (!isPlainObject(parsed.value)) {
+      return wrapResponse(
+        createJsonResponse(
+          { success: false, error: "Request body must be a JSON object" },
+          400
+        )
+      );
+    }
+
+    const data = parsed.value as WebhookData;
+
+    // Validate the API key using the secret binding (fail-closed)
     const { apiKey } = data;
-    if (!apiKey) {
+    if (typeof apiKey !== "string" || apiKey.length === 0) {
       logger.warn("[handleRequest] apiKey missing from payload");
       return wrapResponse(
         createJsonResponse({ success: false, error: "Forbidden" }, 403)
       );
     }
 
-    const isValid = await validateApiKeyBinding(
-      apiKey,
-      env.WEBHOOK_API_KEY_BINDING
-    );
+    const isValid = validateApiKeyBinding(apiKey, env.WEBHOOK_API_KEY_BINDING);
     if (!isValid) {
       logger.warn("[handleRequest] Invalid apiKey provided");
       return wrapResponse(
@@ -373,12 +535,31 @@ async function handleRequest(
     // Remove the API key from the data before processing/forwarding
     delete data.apiKey;
 
-    // Get or create session for tracking (use the validated apiKey before it was removed)
-    const session = await getOrCreateSession(env.SESSIONS_KV, apiKey);
+    // Session + queue mode in parallel (independent KV namespaces / keys)
+    const [session, queueMode] = await Promise.all([
+      getOrCreateSession(env.SESSIONS_KV, apiKey),
+      getQueueMode(env.CONFIG_KV),
+    ]);
 
-    // Generate tracking ID
+    // Rate-limit by stable session key (apiKey-backed), NOT per-request UUID
+    if (!(await checkRateLimit(session.sessionId, env))) {
+      logger.warn(
+        `[handleRequest] Rate limit exceeded for session ${session.sessionId.slice(0, 8)}…`
+      );
+      return wrapResponse(
+        createJsonResponse(
+          {
+            success: false,
+            error: `Rate limit exceeded. Maximum ${MAX_TRADES_PER_MINUTE} trades per minute.`,
+            code: "RATE_LIMITED",
+          },
+          429
+        )
+      );
+    }
+
     const requestId = crypto.randomUUID();
-    let overallSuccess = true; // Track overall status
+    let overallSuccess = true;
     const errorMessages: string[] = [];
 
     const {
@@ -390,20 +571,32 @@ async function handleRequest(
       leverage,
       test,
       notify,
+      idempotencyKey: bodyIdempotencyKey,
     } = data;
 
-    // Process trading signal if present
+    // Prefer body key, then Idempotency-Key header
+    const headerIdempotencyKey =
+      request.headers.get("Idempotency-Key") ??
+      request.headers.get("idempotency-key") ??
+      undefined;
+    const clientIdempotencyKey =
+      typeof bodyIdempotencyKey === "string" && bodyIdempotencyKey.length > 0
+        ? bodyIdempotencyKey
+        : headerIdempotencyKey || undefined;
+
+    // Process trading signal if any trade field is present (strict validation)
     let tradeResult: ServiceResponse | null = null;
-    const queueMode = await getQueueMode(env.CONFIG_KV);
-    if (exchange && action && symbol && quantity) {
-      // Validate trade payload with Zod schema
+    if (hasTradeIntent(data)) {
+      // Normalize action case before schema validation
+      const normalizedAction =
+        typeof action === "string" ? action.toUpperCase() : action;
       const tradePayload = {
         exchange,
-        action,
+        action: normalizedAction,
         symbol,
         quantity,
-        price,
-        leverage,
+        price: price === null ? undefined : price,
+        leverage: leverage === null ? undefined : leverage,
         test,
       };
       const validation = validateJson(WebhookPayloadSchema, tradePayload);
@@ -418,16 +611,18 @@ async function handleRequest(
           )
         );
       }
+      const v = validation.value;
       tradeResult = await processTrade(
         {
           requestId,
-          exchange,
-          action,
-          symbol,
-          quantity,
-          price,
-          leverage,
-          test,
+          exchange: v.exchange,
+          action: v.action,
+          symbol: v.symbol,
+          quantity: v.quantity,
+          price: v.price,
+          leverage: v.leverage,
+          test: v.test,
+          idempotencyKey: clientIdempotencyKey,
         },
         env,
         queueMode
@@ -444,11 +639,29 @@ async function handleRequest(
     // Process notification if requested
     let notificationResult: ServiceResponse | null = null;
     if (notify) {
+      const chatIdRaw = notify?.chatId;
+      const chatIdValid =
+        (typeof chatIdRaw === "string" && chatIdRaw.length > 0) ||
+        (typeof chatIdRaw === "number" && Number.isFinite(chatIdRaw));
+      if (typeof notify !== "object" || notify === null || !chatIdValid) {
+        return wrapResponse(
+          createJsonResponse(
+            {
+              success: false,
+              error: "Invalid notify payload: chatId is required",
+            },
+            400
+          )
+        );
+      }
       notificationResult = await processNotification(
         {
           requestId,
-          message: notify.message || createDefaultMessage(data),
-          chatId: notify.chatId,
+          message:
+            typeof notify.message === "string" && notify.message.length > 0
+              ? notify.message
+              : createDefaultMessage(data),
+          chatId: chatIdRaw,
         },
         env
       );
@@ -463,7 +676,20 @@ async function handleRequest(
       }
     }
 
-    // Track webhook API call (non-blocking)
+    if (!hasTradeIntent(data) && !notify) {
+      return wrapResponse(
+        createJsonResponse(
+          {
+            success: false,
+            error:
+              "Nothing to process: provide trade fields and/or a notify payload",
+          },
+          400
+        )
+      );
+    }
+
+    // Track webhook API call (fire-and-forget)
     const latencyMs = Date.now() - startTime;
     ctx.waitUntil(
       trackAnalytics(env as AnalyticsEnv, "/track/api-call", {
@@ -474,82 +700,72 @@ async function handleRequest(
       })
     );
 
-    // --- Construct Response ---
+    const tradeQueued =
+      tradeResult?.success === true &&
+      tradeResult.tradeResult !== null &&
+      typeof tradeResult.tradeResult === "object" &&
+      (tradeResult.tradeResult as { queued?: boolean }).queued === true;
+
     if (overallSuccess) {
+      const status = tradeQueued ? 202 : 200;
       logger.info(
-        `[handleRequest] Returning SUCCESS response (status 200) for ${requestId}`
+        `[handleRequest] Returning SUCCESS response (status ${status}) for ${requestId}`
       );
       return wrapResponse(
         createJsonResponse(
           {
             success: true,
             requestId,
+            ...(tradeQueued ? { status: "Enqueued" } : {}),
             tradeResult,
             notificationResult,
           },
-          200
-        )
-      );
-    } else {
-      logger.info(
-        `[handleRequest] Returning FAILURE response (status 500) for ${requestId} due to: ${errorMessages.join(
-          "; "
-        )}`
-      );
-      return wrapResponse(
-        createJsonResponse(
-          {
-            success: false,
-            requestId,
-            error: `Processing failed: ${errorMessages.join("; ")}`,
-            tradeResult, // Include partial results/errors
-            notificationResult,
-          },
-          500
+          status
         )
       );
     }
+
+    // Map known client-facing failures to appropriate statuses
+    const isDuplicate = errorMessages.some((m) =>
+      m.toLowerCase().includes("duplicate")
+    );
+    const status = isDuplicate ? 409 : 500;
+    logger.info(
+      `[handleRequest] Returning FAILURE response (status ${status}) for ${requestId}`
+    );
+    return wrapResponse(
+      createJsonResponse(
+        {
+          success: false,
+          requestId,
+          error: `Processing failed: ${errorMessages.join("; ")}`,
+          tradeResult,
+          notificationResult,
+        },
+        status
+      )
+    );
   } catch (error: unknown) {
-    const errorMsg = toError(error, "Internal Server Error");
-    logger.error(`[handleRequest] Uncaught error: ${errorMsg}`, {
+    // Never leak stack / internal details to the client
+    logger.error(`[handleRequest] Uncaught error`, {
       error: toError(error),
     });
-    return wrapResponse(Errors.internal(errorMsg));
+    return wrapResponse(Errors.internal("Internal Server Error"));
   }
 }
 
 /**
  * Secure API key validation using a secret binding.
+ * Fail-closed: missing binding → reject. Constant-time compare.
  */
-async function validateApiKeyBinding(
-  apiKey: string,
-  binding?: string
-): Promise<boolean> {
-  if (!binding) {
+function validateApiKeyBinding(apiKey: string, binding?: string): boolean {
+  if (!binding || binding.length === 0) {
     logger.error(
       "[validateApiKeyBinding] WEBHOOK_API_KEY_BINDING is not configured."
     );
     return false;
   }
-  try {
-    const expectedKey = binding;
-    if (!expectedKey) {
-      logger.error(
-        "[validateApiKeyBinding] Failed to retrieve key from binding."
-      );
-      return false;
-    }
-    // Constant-time comparison to prevent timing attacks on API key
-    const isValid = timingSafeEqual(apiKey, expectedKey);
-    logger.info(`[validateApiKeyBinding] Validation result: ${isValid}`);
-    return isValid;
-  } catch (e: unknown) {
-    const errorMsg = toError(e, "Error retrieving secret");
-    logger.error("[validateApiKeyBinding] Error retrieving secret:", {
-      error: errorMsg,
-    });
-    return false;
-  }
+  return timingSafeEqual(apiKey, binding);
 }
 
 /**
@@ -564,21 +780,34 @@ async function getQueueMode(
 }
 
 /**
- * Generate idempotency key for a trade
+ * Generate fingerprint idempotency key for a trade when the client did not
+ * supply one. Mode-split so live and test fills never dedupe each other.
  */
 function generateIdempotencyKey(tradeData: TradeData): string {
-  // Include test mode so a live fill and a testnet fill with the same
-  // size/symbol do not dedupe each other.
   const mode = tradeData.test === true ? "test" : "live";
   return `trade:${tradeData.exchange}:${tradeData.symbol}:${tradeData.action}:${tradeData.quantity}:${mode}`;
 }
 
 /**
- * Check and store idempotency key using Durable Object
+ * Resolve client-supplied idempotency key (body or header) or auto-generate.
+ * Client keys are namespaced and mode-split to avoid collisions.
+ */
+function resolveIdempotencyKey(tradeData: TradeData): string {
+  const provided = tradeData.idempotencyKey?.trim();
+  if (provided && provided.length > 0 && provided.length <= MAX_IDEMPOTENCY_KEY_LEN) {
+    const mode = tradeData.test === true ? "test" : "live";
+    return `idemp:${provided}:${mode}`;
+  }
+  return generateIdempotencyKey(tradeData);
+}
+
+/**
+ * Check and store idempotency key using Durable Object.
+ * Returns true if the key is new (proceed), false if duplicate.
  */
 async function checkIdempotency(env: Env, key: string): Promise<boolean> {
   if (!env.IDEMPOTENCY_STORE) {
-    return true; // No DO configured, allow all
+    return true; // No DO configured — cannot dedupe; allow (ops should bind DO in prod)
   }
 
   try {
@@ -587,13 +816,15 @@ async function checkIdempotency(env: Env, key: string): Promise<boolean> {
     return await stub.checkAndStore(key);
   } catch (error) {
     logger.error("[checkIdempotency] Error:", { error: toError(error) });
-    return true; // Allow on error to not block trades
+    // Fail open on DO errors so a DO outage does not halt all trading.
+    return true;
   }
 }
 
 /**
  * Rate limiting delegation — uses KV-backed rate limiter when available,
  * falls back to in-memory (per-isolation, resets on cold start).
+ * Key must be stable across requests (session / apiKey), never a UUID.
  */
 async function checkRateLimit(sessionId: string, env: Env): Promise<boolean> {
   return kvRateLimit(env.CONFIG_KV ?? null, `session:${sessionId}`, {
@@ -645,12 +876,12 @@ async function processTrade(
   });
   logger.info(`[${requestId}] Queue mode: ${queueMode}`);
 
-  // Check idempotency before processing
-  const idempotencyKey = generateIdempotencyKey(tradeData);
+  // Check idempotency before processing (client key or auto fingerprint)
+  const idempotencyKey = resolveIdempotencyKey(tradeData);
   const isNew = await checkIdempotency(env, idempotencyKey);
   if (!isNew) {
     logger.info(
-      `[${requestId}] Duplicate trade detected, rejecting: ${idempotencyKey}`
+      `[${requestId}] Duplicate trade detected, rejecting key prefix: ${idempotencyKey.slice(0, 48)}`
     );
     return {
       success: false,
@@ -659,16 +890,7 @@ async function processTrade(
     };
   }
 
-  // Check rate limit (using session ID from request or generated)
-  const sessionId = tradeData.requestId; // Use requestId as session key
-  if (!(await checkRateLimit(sessionId, env))) {
-    logger.info(`[${requestId}] Rate limit exceeded for session: ${sessionId}`);
-    return {
-      success: false,
-      requestId,
-      error: `Rate limit exceeded. Maximum ${MAX_TRADES_PER_MINUTE} trades per minute.`,
-    };
-  }
+  // Rate limit is enforced in handleRequest against the stable session key.
 
   // Check if we should use queue
   const useQueue = queueMode === "queue_everywhere" || !env.TRADE_SERVICE;
@@ -735,9 +957,11 @@ async function processTrade(
     );
 
     if (!response.ok) {
+      // Log upstream body server-side only — never echo to the client
       const errorText = await response.text();
       logger.error(
-        `[${requestId}] Error calling TRADE_SERVICE: ${response.status} - ${errorText}`
+        `[${requestId}] Error calling TRADE_SERVICE: ${response.status}`,
+        { upstream: errorText.slice(0, 500) }
       );
 
       // If in queue_failover mode and direct call failed, try queue as fallback
@@ -766,7 +990,7 @@ async function processTrade(
       return {
         success: false,
         requestId,
-        error: `Trade service call failed: ${response.status} - ${errorText}`,
+        error: `Trade service call failed (${response.status})`,
       };
     }
 
@@ -884,12 +1108,13 @@ async function processNotification(
     if (!response.ok) {
       const errorText = await response.text();
       logger.error(
-        `[${requestId}] Error calling TELEGRAM_SERVICE: ${response.status} - ${errorText}`
+        `[${requestId}] Error calling TELEGRAM_SERVICE: ${response.status}`,
+        { upstream: errorText.slice(0, 500) }
       );
       return {
         success: false,
         requestId,
-        error: `Telegram service call failed: ${response.status} - ${errorText}`,
+        error: `Telegram service call failed (${response.status})`,
       };
     }
 
@@ -920,11 +1145,11 @@ async function processNotification(
 // Create default message from trade data
 function createDefaultMessage(data: WebhookData): string {
   const { exchange, action, symbol, quantity, price } = data;
-  let message = `📊 Trade Alert: ${action} ${symbol}\n`;
-  message += `📈 Exchange: ${exchange}\n`;
-  message += `💰 Quantity: ${quantity}\n`;
+  let message = `📊 Trade Alert: ${action ?? "?"} ${symbol ?? "?"}\n`;
+  message += `📈 Exchange: ${exchange ?? "?"}\n`;
+  message += `💰 Quantity: ${quantity ?? "?"}\n`;
 
-  if (price !== undefined) {
+  if (price !== undefined && price !== null) {
     message += `💵 Price: ${price}\n`;
   }
 

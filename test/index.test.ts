@@ -249,6 +249,8 @@ describe("Hoox Worker - Health Check Endpoint", () => {
     const response = await webhookReceiver.fetch(request, env, ctx);
     const body = (await response.json()) as any;
     expect(body).toHaveProperty("status");
+    expect(body.status).toBe("ok");
+    expect(body).toHaveProperty("bindings");
   });
 
   it("GET /health includes security headers", async () => {
@@ -635,17 +637,15 @@ describe("Hoox Worker - Event Processing", () => {
     const ctx = createMockContext();
 
     const response = await webhookReceiver.fetch(request, env, ctx);
+    expect(response.status).toBeLessThan(500);
 
-    // Verify trade service was called
-    if (env.TRADE_SERVICE?.fetch) {
-      const calls = (env.TRADE_SERVICE.fetch as any).mock?.calls || [];
-      if (calls.length > 0) {
-        const tradeRequest = calls[0][0] as Request;
-        const bodyText = await tradeRequest.text();
-        const tradeBody = JSON.parse(bodyText || "{}");
-        expect(tradeBody.apiKey).toBeUndefined();
-      }
-    }
+    // serviceFetch passes (url: string, init: RequestInit) — not a Request
+    const calls = (env.TRADE_SERVICE?.fetch as any)?.mock?.calls || [];
+    expect(calls.length).toBeGreaterThan(0);
+    const init = calls[0][1] as RequestInit;
+    const tradeBody = JSON.parse(String(init.body || "{}"));
+    expect(tradeBody.apiKey).toBeUndefined();
+    expect(tradeBody.exchange).toBe("binance");
   });
 
   it("processes trade and notification together", async () => {
@@ -818,6 +818,109 @@ describe("Hoox Worker - Error Handling", () => {
 
     const response = await webhookReceiver.fetch(request, env, ctx);
     expect([400, 401, 403, 500]).toContain(response.status);
+  });
+
+  it("returns 503 when kill switch is enabled", async () => {
+    const env = createMockEnv();
+    env.CONFIG_KV.get = mock(async (key: string) =>
+      key === "trade:kill_switch" ? "true" : null
+    );
+    const request = new Request("https://example.com/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "52.89.214.238",
+      },
+      body: JSON.stringify({
+        apiKey: "test-api-key",
+        exchange: "binance",
+        action: "LONG",
+        symbol: "BTCUSDT",
+        quantity: 0.1,
+      }),
+    });
+    const response = await webhookReceiver.fetch(
+      request,
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as any;
+    expect(body.success).toBe(false);
+    expect(body.code).toBe("KILL_SWITCH");
+  });
+
+  it("rejects oversized JSON body via Content-Length", async () => {
+    const request = new Request("https://example.com/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "52.89.214.238",
+        "Content-Length": String(200_000),
+      },
+      body: JSON.stringify({ apiKey: "test-api-key" }),
+    });
+    const response = await webhookReceiver.fetch(
+      request,
+      createMockEnv() as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(413);
+  });
+
+  it("accepts client idempotencyKey and does not forward apiKey", async () => {
+    const request = new Request("https://example.com/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "52.89.214.238",
+      },
+      body: JSON.stringify({
+        apiKey: "test-api-key",
+        exchange: "binance",
+        action: "LONG",
+        symbol: "BTCUSDT",
+        quantity: 0.1,
+        idempotencyKey: "client-key-abc",
+      }),
+    });
+    const env = createMockEnv();
+    const response = await webhookReceiver.fetch(
+      request,
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBeLessThan(500);
+    // DO should be keyed with client-provided idemp namespace
+    const idFromName = env.IDEMPOTENCY_STORE.idFromName as ReturnType<
+      typeof mock
+    >;
+    expect(idFromName.mock.calls.length).toBeGreaterThan(0);
+    const usedKey = String(idFromName.mock.calls[0][0]);
+    expect(usedKey).toContain("client-key-abc");
+  });
+
+  it("POST / aliases /webhook", async () => {
+    const request = new Request("https://example.com/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "52.89.214.238",
+      },
+      body: JSON.stringify({
+        apiKey: "test-api-key",
+        exchange: "binance",
+        action: "LONG",
+        symbol: "BTCUSDT",
+        quantity: 0.1,
+      }),
+    });
+    const response = await webhookReceiver.fetch(
+      request,
+      createMockEnv() as any,
+      createMockContext()
+    );
+    expect(response.status).toBeLessThan(500);
   });
 });
 

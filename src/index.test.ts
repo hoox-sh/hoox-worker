@@ -249,6 +249,8 @@ describe("Hoox Worker - Health Check Endpoint", () => {
     const response = await webhookReceiver.fetch(request, env, ctx);
     const body = (await response.json()) as any;
     expect(body).toHaveProperty("status");
+    expect(body.status).toBe("ok");
+    expect(body).toHaveProperty("bindings");
   });
 
   it("GET /health includes security headers", async () => {
@@ -635,17 +637,15 @@ describe("Hoox Worker - Event Processing", () => {
     const ctx = createMockContext();
 
     const response = await webhookReceiver.fetch(request, env, ctx);
+    expect(response.status).toBeLessThan(500);
 
-    // Verify trade service was called
-    if (env.TRADE_SERVICE?.fetch) {
-      const calls = (env.TRADE_SERVICE.fetch as any).mock?.calls || [];
-      if (calls.length > 0) {
-        const tradeRequest = calls[0][0] as Request;
-        const bodyText = await tradeRequest.text();
-        const tradeBody = JSON.parse(bodyText || "{}");
-        expect(tradeBody.apiKey).toBeUndefined();
-      }
-    }
+    // serviceFetch passes (url: string, init: RequestInit) — not a Request
+    const calls = (env.TRADE_SERVICE?.fetch as any)?.mock?.calls || [];
+    expect(calls.length).toBeGreaterThan(0);
+    const init = calls[0][1] as RequestInit;
+    const tradeBody = JSON.parse(String(init.body || "{}"));
+    expect(tradeBody.apiKey).toBeUndefined();
+    expect(tradeBody.exchange).toBe("binance");
   });
 
   it("processes trade and notification together", async () => {

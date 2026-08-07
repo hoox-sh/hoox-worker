@@ -39,9 +39,12 @@ TradingView / webhooks
 
 | Method | Path / surface | Auth | Description |
 | ------ | -------------- | ---- | ----------- |
-| `POST` | `/` or webhook routes | API key + optional IP allowlist | Primary signal ingress |
-| `GET`  | `/health` | None | Liveness probe |
-| DO     | Idempotency store | Internal | Deduplicate trade traces |
+| `POST` | `/webhook` or `/` | Body `apiKey` (timing-safe) + optional IP allowlist | Primary signal ingress |
+| `GET`  | `/health` | None | Liveness probe (binding presence only) |
+| `GET`  | `/v1/health`, `/v1/workers`, SSE streams | Bearer `OPERATOR_API_KEY` | Operator management plane |
+| DO     | `IdempotencyStore` | Internal | Deduplicate trade traces |
+
+**Ingress controls (webhook):** kill switch (`trade:kill_switch` \| `global:kill_switch` → 503), TradingView IP allowlist, 64 KiB body cap, session rate limit (10/min), DO idempotency (body/`Idempotency-Key` or auto fingerprint).
 
 ### CLI
 

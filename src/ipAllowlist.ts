@@ -80,17 +80,23 @@ export async function loadIpConfig(
   }
 
   try {
-    const kvValue = await kv.get(KV_IP_CHECK_ENABLED_KEY);
+    // Parallel KV reads to shave critical-path latency
+    const [kvValue, customIpsStr] = await Promise.all([
+      kv.get(KV_IP_CHECK_ENABLED_KEY),
+      kv.get(KV_ALLOWED_IPS_KEY),
+    ]);
+
     if (kvValue !== null && kvValue !== undefined) {
       ipCheckEnabled = kvValue.toLowerCase() === "true";
     }
 
-    const customIpsStr = await kv.get(KV_ALLOWED_IPS_KEY);
     if (customIpsStr) {
       try {
         const customIps = JSON.parse(customIpsStr);
         if (Array.isArray(customIps) && customIps.length > 0) {
-          allowedIps = new Set(customIps);
+          allowedIps = new Set(
+            customIps.filter((ip): ip is string => typeof ip === "string")
+          );
         }
       } catch (parseError) {
         logger.error("Error parsing IP config JSON from KV", {
