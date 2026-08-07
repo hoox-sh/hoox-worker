@@ -418,7 +418,10 @@ async function readJsonBodyWithLimit(
   }
 
   try {
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(merged);
+    const text = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(merged);
     return { ok: true, value: JSON.parse(text) as unknown };
   } catch {
     return { ok: false, status: 400, error: "Invalid JSON in request body" };
