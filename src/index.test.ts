@@ -159,9 +159,20 @@ describe("Hoox Worker - Operator /v1 routes", () => {
 
   it("GET /v1/trades/stream returns event-stream when authorized", async () => {
     const env = createMockEnv();
+    env.TRADE_SERVICE = {
+      fetch: mock(
+        async () =>
+          new Response(JSON.stringify({ success: true, result: [] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+      ),
+    };
+    const ac = new AbortController();
     const request = new Request("https://example.com/v1/trades/stream", {
       method: "GET",
       headers: operatorAuthHeaders(),
+      signal: ac.signal,
     });
     const response = await webhookReceiver.fetch(
       request,
@@ -172,9 +183,16 @@ describe("Hoox Worker - Operator /v1 routes", () => {
     expect(response.headers.get("Content-Type") ?? "").toContain(
       "text/event-stream"
     );
-    const text = await response.text();
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    const { value } = await reader.read();
+    if (value) text += decoder.decode(value);
+    ac.abort();
+    await reader.cancel().catch(() => {});
     expect(text).toContain("data:");
     expect(text).toContain("trades");
+    expect(text).toContain("connected");
   });
 
   it("GET /workers alias requires auth", async () => {

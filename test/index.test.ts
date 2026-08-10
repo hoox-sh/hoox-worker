@@ -155,9 +155,21 @@ describe("Hoox Worker - Operator /v1 routes", () => {
 
   it("GET /v1/trades/stream returns event-stream when authorized", async () => {
     const env = createMockEnv();
+    // Mock trade-worker feed so the stream can seed and exit cleanly on cancel
+    env.TRADE_SERVICE = {
+      fetch: mock(
+        async () =>
+          new Response(JSON.stringify({ success: true, result: [] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+      ),
+    };
+    const ac = new AbortController();
     const request = new Request("https://example.com/v1/trades/stream", {
       method: "GET",
       headers: operatorAuthHeaders(),
+      signal: ac.signal,
     });
     const response = await webhookReceiver.fetch(
       request,
@@ -168,9 +180,55 @@ describe("Hoox Worker - Operator /v1 routes", () => {
     expect(response.headers.get("Content-Type") ?? "").toContain(
       "text/event-stream"
     );
-    const text = await response.text();
+    // Read first chunk (connected event), then abort so the long-lived stream ends
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    const { value } = await reader.read();
+    if (value) text += decoder.decode(value);
+    ac.abort();
+    await reader.cancel().catch(() => {});
     expect(text).toContain("data:");
     expect(text).toContain("trades");
+    expect(text).toContain("connected");
+  });
+
+  it("GET /v1/logs/stream returns event-stream when authorized", async () => {
+    const env = createMockEnv();
+    env.TRADE_SERVICE = {
+      fetch: mock(
+        async () =>
+          new Response(JSON.stringify({ success: true, result: [] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+      ),
+    };
+    const ac = new AbortController();
+    const request = new Request("https://example.com/v1/logs/stream", {
+      method: "GET",
+      headers: operatorAuthHeaders(),
+      signal: ac.signal,
+    });
+    const response = await webhookReceiver.fetch(
+      request,
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type") ?? "").toContain(
+      "text/event-stream"
+    );
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    const { value } = await reader.read();
+    if (value) text += decoder.decode(value);
+    ac.abort();
+    await reader.cancel().catch(() => {});
+    expect(text).toContain("data:");
+    expect(text).toContain("logs");
+    expect(text).toContain("connected");
   });
 
   it("GET /workers alias requires auth", async () => {
@@ -646,6 +704,62 @@ describe("Hoox Worker - Event Processing", () => {
     const tradeBody = JSON.parse(String(init.body || "{}"));
     expect(tradeBody.apiKey).toBeUndefined();
     expect(tradeBody.exchange).toBe("binance");
+  });
+
+  it("forwards resolved Idempotency-Key header to TRADE_SERVICE", async () => {
+    const request = new Request("https://example.com/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "52.89.214.238",
+      },
+      body: JSON.stringify({
+        ...validPayload,
+        idempotencyKey: "client-key-abc",
+      }),
+    });
+    const env = createMockEnv();
+    const response = await webhookReceiver.fetch(
+      request,
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBeLessThan(500);
+
+    const calls = (env.TRADE_SERVICE?.fetch as any)?.mock?.calls || [];
+    expect(calls.length).toBeGreaterThan(0);
+    const init = calls[0][1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    // Gateway resolves client keys as idemp:{key}:{mode}
+    expect(headers["Idempotency-Key"]).toBe("idemp:client-key-abc:live");
+    expect(headers["X-Request-ID"]).toBeDefined();
+    expect(headers["X-Internal-Auth-Key"]).toBe("test-internal-key");
+  });
+
+  it("forwards auto-fingerprint Idempotency-Key when client key absent", async () => {
+    const request = new Request("https://example.com/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "52.89.214.238",
+      },
+      body: JSON.stringify(validPayload),
+    });
+    const env = createMockEnv();
+    const response = await webhookReceiver.fetch(
+      request,
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBeLessThan(500);
+
+    const calls = (env.TRADE_SERVICE?.fetch as any)?.mock?.calls || [];
+    expect(calls.length).toBeGreaterThan(0);
+    const init = calls[0][1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    expect(headers["Idempotency-Key"]).toBe(
+      "trade:binance:BTCUSDT:LONG:0.1:live"
+    );
   });
 
   it("processes trade and notification together", async () => {

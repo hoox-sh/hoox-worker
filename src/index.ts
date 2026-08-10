@@ -47,6 +47,7 @@ import {
   DISCLAIMER,
   DISCLAIMER_HEADER,
 } from "@hoox-sh/hoox-shared/legal";
+import { createOperatorSseStream } from "./operatorSse";
 
 // --- Rate limiting limits (passed to KV-backed rate limiter) ---
 const MAX_TRADES_PER_MINUTE = 10;
@@ -243,7 +244,7 @@ router.get(
   async (request: Request, env: Env, _ctx: ExecutionContext) => {
     const denied = await requireOperatorAuth(request, env);
     if (denied) return wrapResponse(denied);
-    return wrapResponse(createOperatorSseStub("trades"));
+    return wrapResponse(createOperatorSseStream("trades", env, request));
   }
 );
 
@@ -252,7 +253,7 @@ router.get(
   async (request: Request, env: Env, _ctx: ExecutionContext) => {
     const denied = await requireOperatorAuth(request, env);
     if (denied) return wrapResponse(denied);
-    return wrapResponse(createOperatorSseStub("logs"));
+    return wrapResponse(createOperatorSseStream("logs", env, request));
   }
 );
 
@@ -275,34 +276,6 @@ export default {
     { service: "hoox-gateway", module: "router" }
   ),
 };
-
-/**
- * Minimal SSE stub so remote TUI can open a stream after auth.
- * Emits one connected event then closes (client may reconnect).
- */
-function createOperatorSseStub(stream: "trades" | "logs"): Response {
-  const encoder = new TextEncoder();
-  const body = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const payload = JSON.stringify({
-        type: "connected",
-        stream,
-        ts: Date.now(),
-      });
-      controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
-      controller.enqueue(encoder.encode(`: operator-stream-stub\n\n`));
-      controller.close();
-    },
-  });
-  return new Response(body, {
-    status: 200,
-    headers: {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    },
-  });
-}
 
 // --- Request Handling Logic ---
 
@@ -820,11 +793,13 @@ async function checkRateLimit(sessionId: string, env: Env): Promise<boolean> {
 }
 
 /**
- * Send trade to queue for async processing
+ * Send trade to queue for async processing.
+ * Passes the gateway-resolved idempotency key so trade-worker KV aligns with DO.
  */
 async function sendTradeToQueue(
   queue: Queue,
-  tradeData: TradeData
+  tradeData: TradeData,
+  idempotencyKey?: string
 ): Promise<void> {
   const message = {
     requestId: tradeData.requestId,
@@ -835,6 +810,7 @@ async function sendTradeToQueue(
     price: tradeData.price,
     leverage: tradeData.leverage,
     test: tradeData.test,
+    ...(idempotencyKey ? { idempotencyKey } : {}),
     queuedAt: new Date().toISOString(),
   };
   await queue.send(message);
@@ -884,7 +860,7 @@ async function processTrade(
   if (useQueue && env.TRADE_QUEUE) {
     // Use queue mode - send to queue and return success immediately
     try {
-      await sendTradeToQueue(env.TRADE_QUEUE, tradeData);
+      await sendTradeToQueue(env.TRADE_QUEUE, tradeData, idempotencyKey);
       return {
         success: true,
         requestId,
@@ -928,6 +904,8 @@ async function processTrade(
       `[${requestId}] Calling TRADE_SERVICE service binding with payload`,
       { payload: tradeWorkerPayload }
     );
+    // Forward gateway-resolved Idempotency-Key so trade-worker KV shares the
+    // same logical key as the DO check (client key or auto fingerprint).
     const response = await serviceFetch(
       env.TRADE_SERVICE,
       "/webhook",
@@ -935,6 +913,7 @@ async function processTrade(
       {
         headers: {
           "X-Request-ID": requestId,
+          "Idempotency-Key": idempotencyKey,
           ...(internalAuthKey
             ? { "X-Internal-Auth-Key": internalAuthKey as string }
             : {}),
@@ -956,7 +935,7 @@ async function processTrade(
           `[${requestId}] Direct call failed, attempting queue fallback...`
         );
         try {
-          await sendTradeToQueue(env.TRADE_QUEUE, tradeData);
+          await sendTradeToQueue(env.TRADE_QUEUE, tradeData, idempotencyKey);
           return {
             success: true,
             requestId,
@@ -1003,7 +982,7 @@ async function processTrade(
         `[${requestId}] Direct call exception, attempting queue fallback...`
       );
       try {
-        await sendTradeToQueue(env.TRADE_QUEUE, tradeData);
+        await sendTradeToQueue(env.TRADE_QUEUE, tradeData, idempotencyKey);
         return {
           success: true,
           requestId,
