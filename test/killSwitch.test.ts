@@ -6,14 +6,14 @@
 import { describe, expect, test, beforeEach, jest } from "bun:test";
 import { checkKillSwitch, isTradingPaused } from "../src/killSwitch";
 
-describe("killSwitch", () => {
+describe("killSwitch (gateway wrapper)", () => {
   let mockGet: jest.Mock;
 
   beforeEach(() => {
     mockGet = jest.fn();
   });
 
-  test("returns enabled: false when KV is undefined", async () => {
+  test("returns enabled: false when KV is undefined (fail-open missing)", async () => {
     const result = await checkKillSwitch(undefined);
     expect(result.enabled).toBe(false);
   });
@@ -54,6 +54,17 @@ describe("killSwitch", () => {
     expect(result.enabled).toBe(true);
   });
 
+  test("returns enabled: true for truthy 1/yes/on", async () => {
+    for (const flag of ["1", "yes", "on"]) {
+      mockGet.mockImplementation(async (key: string) =>
+        key === "trade:kill_switch" ? flag : null
+      );
+      const kv = { get: mockGet } as any;
+      const result = await checkKillSwitch(kv);
+      expect(result.enabled).toBe(true);
+    }
+  });
+
   test("returns enabled: false for other values", async () => {
     mockGet.mockResolvedValue("false");
     const kv = { get: mockGet } as any;
@@ -61,11 +72,13 @@ describe("killSwitch", () => {
     expect(result.enabled).toBe(false);
   });
 
-  test("handles KV error gracefully", async () => {
+  test("handles KV error fail-closed (gateway onReadError: closed)", async () => {
     mockGet.mockRejectedValue(new Error("KV Error"));
     const kv = { get: mockGet } as any;
     const result = await checkKillSwitch(kv);
-    expect(result.enabled).toBe(false);
+    // Safer than historical fail-open: treat unread kill switch as active.
+    expect(result.enabled).toBe(true);
+    expect(result.source).toBe("read_error");
     expect(result.error).toBeDefined();
   });
 
