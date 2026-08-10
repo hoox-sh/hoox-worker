@@ -132,40 +132,6 @@ const SECURITY_HEADERS = {
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'",
 };
 
-function createSecureResponse(
-  body: string | object,
-  options: ResponseInit = {}
-): Response {
-  const headers: Record<string, string> = { ...SECURITY_HEADERS };
-
-  // Merge with provided headers
-  if (options.headers) {
-    const providedHeaders =
-      typeof options.headers === "object" && !Array.isArray(options.headers)
-        ? options.headers
-        : {};
-
-    // Handle Headers object or Record
-    for (const [key, value] of Object.entries(providedHeaders)) {
-      if (value) headers[key] = value;
-    }
-  }
-
-  // Always attach disclaimer header
-  headers[DISCLAIMER_HEADER] = DISCLAIMER;
-
-  return new Response(typeof body === "string" ? body : JSON.stringify(body), {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...headers,
-    },
-  });
-}
-
-// Alias for convenience
-const secureResponse = createSecureResponse;
-
 // --- Response Wrapper for Security Headers ---
 function wrapResponse(response: Response): Response {
   const headers = new Headers(response.headers);
@@ -179,10 +145,6 @@ function wrapResponse(response: Response): Response {
     headers,
   });
 }
-
-// --- KV Configuration Keys ---
-const KV_IP_CHECK_ENABLED_KEY = KVKeys.KV_WEBHOOK_IP_CHECK_ENABLED;
-const KV_ALLOWED_IPS_KEY = KVKeys.KV_WEBHOOK_ALLOWED_IPS;
 
 // --- Default Export (Worker Entry Point) ---
 
@@ -641,12 +603,32 @@ async function handleRequest(
 
     // Process notification if requested
     let notificationResult: ServiceResponse | null = null;
-    if (notify) {
-      const chatIdRaw = notify?.chatId;
+    if (notify !== undefined && notify !== null) {
+      // Reject non-plain objects (arrays, Date, RegExp, primitives, etc.)
+      if (
+        typeof notify !== "object" ||
+        Array.isArray(notify) ||
+        Object.prototype.toString.call(notify) !== "[object Object]"
+      ) {
+        return wrapResponse(
+          createJsonResponse(
+            {
+              success: false,
+              error: "Invalid notify payload: chatId is required",
+            },
+            400
+          )
+        );
+      }
+      const notifyPayload = notify as {
+        message?: unknown;
+        chatId?: unknown;
+      };
+      const chatIdRaw = notifyPayload.chatId;
       const chatIdValid =
         (typeof chatIdRaw === "string" && chatIdRaw.length > 0) ||
         (typeof chatIdRaw === "number" && Number.isFinite(chatIdRaw));
-      if (typeof notify !== "object" || notify === null || !chatIdValid) {
+      if (!chatIdValid) {
         return wrapResponse(
           createJsonResponse(
             {
@@ -661,10 +643,11 @@ async function handleRequest(
         {
           requestId,
           message:
-            typeof notify.message === "string" && notify.message.length > 0
-              ? notify.message
+            typeof notifyPayload.message === "string" &&
+            notifyPayload.message.length > 0
+              ? notifyPayload.message
               : createDefaultMessage(data),
-          chatId: chatIdRaw,
+          chatId: chatIdRaw as string | number,
         },
         env
       );
