@@ -14,8 +14,8 @@
     "@hoox-sh/hoox-shared/legal": "../../packages/shared/src/legal.ts",
     "@hoox-sh/hoox-shared/service-bindings": "../../packages/shared/src/service-bindings.ts"
   },
-  // COMPATIBILITY_DATE: Use current date or latest supported
-  "compatibility_date": "2025-03-07",
+  // COMPATIBILITY_DATE: monorepo standard (align with sibling workers)
+  "compatibility_date": "2026-06-08",
   "compatibility_flags": ["nodejs_compat"],
 
   // PLACEMENT: Smart Placement for reduced latency (free, all plans)
@@ -23,10 +23,11 @@
     "mode": "smart",
   },
 
-  // OBSERVABILITY: Enable logging and sampling
+  // OBSERVABILITY: logs + unified traces (CF May 2026)
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 1,
+    "logs": { "enabled": true, "head_sampling_rate": 1 },
+    "traces": { "enabled": true, "head_sampling_rate": 0.01 }
   },
 
   // VARS: Environment variables (secrets set via `wrangler secret put`)

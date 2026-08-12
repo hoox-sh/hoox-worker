@@ -776,12 +776,39 @@ async function getQueueMode(
 }
 
 /**
+ * Aligned with trade-worker `FP_TIME_BUCKET_MS` / `buildTradeFingerprint`.
+ */
+const FP_TIME_BUCKET_MS = 60_000;
+
+/**
  * Generate fingerprint idempotency key for a trade when the client did not
  * supply one. Mode-split so live and test fills never dedupe each other.
+ *
+ * Format: `trade:{exchange}:{symbol}:{action}:{quantity}:{mode}:{minuteBucket}`
+ *
+ * Tradeoff (documented intentionally):
+ * - A random nonce would defeat dedupe entirely and is NOT used.
+ * - Including a coarse per-minute time bucket (`floor(nowMs / 60_000)`) means
+ *   true retries (e.g. TradingView redelivery) within the same minute still
+ *   collide and are blocked as duplicates, while intentional same-size trades
+ *   in a later minute get a new key and are not accidentally blocked for the
+ *   full DO TTL.
+ * - Client-supplied keys (body / Idempotency-Key) are preferred and are not
+ *   time-bucketed.
+ *
+ * Prefix stays `trade:` (gateway historical format); trade-worker uses
+ * `idemp:fp:` when it mints its own fingerprint for direct ingress. When the
+ * gateway forwards its resolved key, trade-worker uses it as-is.
+ *
+ * @param nowMs - injectable clock for tests; defaults to Date.now()
  */
-function generateIdempotencyKey(tradeData: TradeData): string {
+function generateIdempotencyKey(
+  tradeData: TradeData,
+  nowMs: number = Date.now()
+): string {
   const mode = tradeData.test === true ? "test" : "live";
-  return `trade:${tradeData.exchange}:${tradeData.symbol}:${tradeData.action}:${tradeData.quantity}:${mode}`;
+  const bucket = Math.floor(nowMs / FP_TIME_BUCKET_MS);
+  return `trade:${tradeData.exchange}:${tradeData.symbol}:${tradeData.action}:${tradeData.quantity}:${mode}:${bucket}`;
 }
 
 /**
@@ -848,7 +875,8 @@ async function reserveIdempotency(env: Env, key: string): Promise<boolean> {
 }
 
 /**
- * Phase 2 success: mark reserved key as committed after queue ack or trade 2xx.
+ * Phase 2 success: mark reserved key as committed after queue ack or
+ * trade-service response where HTTP ok AND body.success === true.
  * Errors are logged but not rethrown — the trade already succeeded downstream.
  */
 async function commitIdempotency(env: Env, key: string): Promise<void> {
@@ -1070,15 +1098,32 @@ async function processTrade(
       };
     }
 
-    // Trade service 2xx — commit before parsing body so retries stay blocked
-    await commitIdempotency(env, idempotencyKey);
-
-    // Assuming trade-worker returns a StandardResponse { success: boolean, result?, error? }
-    const result: StandardResponse = await response.json();
+    // Trade service HTTP 2xx — only commit when body indicates true success.
+    // Soft exchange failures (success: false) must release so legitimate retries work.
+    let result: StandardResponse;
+    try {
+      result = (await response.json()) as StandardResponse;
+    } catch (parseError: unknown) {
+      logger.error(`[${requestId}] Failed to parse TRADE_SERVICE response:`, {
+        error: toError(parseError),
+      });
+      await releaseIdempotency(env, idempotencyKey);
+      return {
+        success: false,
+        requestId,
+        error: "Trade service returned an unreadable response.",
+      };
+    }
     logger.info(`[${requestId}] Response from TRADE_SERVICE`, { result });
-    // Adapt response based on trade-worker's actual return structure
+
+    if (result.success === true) {
+      await commitIdempotency(env, idempotencyKey);
+    } else {
+      await releaseIdempotency(env, idempotencyKey);
+    }
+
     return {
-      success: result.success,
+      success: result.success === true,
       requestId,
       tradeResult: result.result,
       error: result.error ?? undefined,

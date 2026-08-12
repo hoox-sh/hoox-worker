@@ -594,6 +594,200 @@ describe("Hoox Worker - Idempotency", () => {
     // Second request should be rejected or return cached response
     expect([200, 201, 202, 400, 409, 500]).toContain(response2.status);
   });
+
+  /** Shared DO stub so reserve/commit/release call counts are observable. */
+  function createTrackableIdempotency() {
+    const stub = {
+      reserve: mock(async () => ({ ok: true, status: "new" as const })),
+      commit: mock(async () => undefined),
+      release: mock(async () => undefined),
+      checkAndStore: mock(async () => true),
+    };
+    return {
+      stub,
+      store: {
+        idFromName: mock((name: string) => ({ name })),
+        get: mock(() => stub),
+      },
+    };
+  }
+
+  function tradeWebhookRequest(extra?: Record<string, unknown>) {
+    return new Request("https://example.com/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "52.89.214.238",
+        "Idempotency-Key": "idem-two-phase-test",
+      },
+      body: JSON.stringify({ ...validPayload, ...extra }),
+    });
+  }
+
+  it("commits idempotency only when trade-service body.success is true", async () => {
+    const { stub, store } = createTrackableIdempotency();
+    const env = createMockEnv({
+      IDEMPOTENCY_STORE: store,
+      // Force direct path (no queue_everywhere); TRADE_SERVICE returns true success
+      TRADE_QUEUE: undefined,
+      TRADE_SERVICE: {
+        fetch: mock(
+          async () =>
+            new Response(
+              JSON.stringify({ success: true, result: { orderId: "o1" } }),
+              { status: 200, headers: { "Content-Type": "application/json" } }
+            )
+        ),
+      },
+    });
+
+    const response = await webhookReceiver.fetch(
+      tradeWebhookRequest(),
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(200);
+    expect(stub.reserve).toHaveBeenCalled();
+    expect(stub.commit).toHaveBeenCalled();
+    expect(stub.release).not.toHaveBeenCalled();
+  });
+
+  it("releases idempotency when trade-service returns 2xx with success: false", async () => {
+    const { stub, store } = createTrackableIdempotency();
+    const env = createMockEnv({
+      IDEMPOTENCY_STORE: store,
+      TRADE_QUEUE: undefined,
+      TRADE_SERVICE: {
+        fetch: mock(
+          async () =>
+            new Response(
+              JSON.stringify({
+                success: false,
+                error: "Exchange rejected: insufficient margin",
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } }
+            )
+        ),
+      },
+    });
+
+    const response = await webhookReceiver.fetch(
+      tradeWebhookRequest(),
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(500);
+    const body = (await response.json()) as { success: boolean };
+    expect(body.success).toBe(false);
+    expect(stub.reserve).toHaveBeenCalled();
+    expect(stub.commit).not.toHaveBeenCalled();
+    expect(stub.release).toHaveBeenCalled();
+  });
+
+  it("releases idempotency when trade-service HTTP is not ok after failover exhausted", async () => {
+    const { stub, store } = createTrackableIdempotency();
+    const env = createMockEnv({
+      IDEMPOTENCY_STORE: store,
+      TRADE_QUEUE: undefined, // no queue fallback
+      TRADE_SERVICE: {
+        fetch: mock(
+          async () =>
+            new Response("upstream unavailable", {
+              status: 503,
+              headers: { "Content-Type": "text/plain" },
+            })
+        ),
+      },
+    });
+
+    const response = await webhookReceiver.fetch(
+      tradeWebhookRequest(),
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(500);
+    expect(stub.reserve).toHaveBeenCalled();
+    expect(stub.commit).not.toHaveBeenCalled();
+    expect(stub.release).toHaveBeenCalled();
+  });
+
+  it("releases idempotency when TRADE_SERVICE is missing and no queue", async () => {
+    const { stub, store } = createTrackableIdempotency();
+    const env = createMockEnv({
+      IDEMPOTENCY_STORE: store,
+      TRADE_SERVICE: undefined,
+      TRADE_QUEUE: undefined,
+    });
+
+    const response = await webhookReceiver.fetch(
+      tradeWebhookRequest(),
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(500);
+    expect(stub.reserve).toHaveBeenCalled();
+    expect(stub.commit).not.toHaveBeenCalled();
+    expect(stub.release).toHaveBeenCalled();
+  });
+
+  it("commits idempotency after successful queue send", async () => {
+    const { stub, store } = createTrackableIdempotency();
+    const queueSend = mock(async () => undefined);
+    const env = createMockEnv({
+      IDEMPOTENCY_STORE: store,
+      TRADE_SERVICE: undefined, // force queue path
+      TRADE_QUEUE: { send: queueSend },
+    });
+
+    const response = await webhookReceiver.fetch(
+      tradeWebhookRequest(),
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(202);
+    expect(queueSend).toHaveBeenCalled();
+    expect(stub.reserve).toHaveBeenCalled();
+    expect(stub.commit).toHaveBeenCalled();
+    expect(stub.release).not.toHaveBeenCalled();
+  });
+
+  it("returns 409 on reserve duplicate without commit or release", async () => {
+    const { stub, store } = createTrackableIdempotency();
+    stub.reserve = mock(async () => ({
+      ok: false,
+      status: "duplicate" as const,
+    }));
+    const env = createMockEnv({
+      IDEMPOTENCY_STORE: store,
+      TRADE_QUEUE: undefined,
+    });
+
+    const response = await webhookReceiver.fetch(
+      tradeWebhookRequest(),
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(409);
+    expect(stub.reserve).toHaveBeenCalled();
+    expect(stub.commit).not.toHaveBeenCalled();
+    expect(stub.release).not.toHaveBeenCalled();
+  });
+
+  it("returns 503 and does not commit when idempotency DO is missing", async () => {
+    const env = createMockEnv({
+      IDEMPOTENCY_STORE: undefined,
+      TRADE_QUEUE: undefined,
+    });
+
+    const response = await webhookReceiver.fetch(
+      tradeWebhookRequest(),
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as { success: boolean };
+    expect(body.success).toBe(false);
+  });
 });
 
 // ============================================================================
@@ -767,9 +961,15 @@ describe("Hoox Worker - Event Processing", () => {
     expect(calls.length).toBeGreaterThan(0);
     const init = calls[0][1] as RequestInit;
     const headers = init.headers as Record<string, string>;
-    expect(headers["Idempotency-Key"]).toBe(
-      "trade:binance:BTCUSDT:LONG:0.1:live"
-    );
+    // Auto fingerprint: trade:{ex}:{sym}:{action}:{qty}:{mode}:{minuteBucket}
+    // Bucket is floor(Date.now()/60_000); allow ±1 for minute boundary races.
+    const bucket = Math.floor(Date.now() / 60_000);
+    const key = headers["Idempotency-Key"];
+    expect(
+      key === `trade:binance:BTCUSDT:LONG:0.1:live:${bucket}` ||
+        key === `trade:binance:BTCUSDT:LONG:0.1:live:${bucket - 1}` ||
+        key === `trade:binance:BTCUSDT:LONG:0.1:live:${bucket + 1}`
+    ).toBe(true);
   });
 
   it("processes trade and notification together", async () => {
