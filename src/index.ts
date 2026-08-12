@@ -42,7 +42,12 @@ import {
   type AnalyticsEnv,
 } from "@hoox-sh/hoox-shared/analytics";
 import { KVKeys } from "@hoox-sh/hoox-shared/kvKeys";
-import { serviceFetch } from "@hoox-sh/hoox-shared/service-bindings";
+import {
+  authenticatedServiceFetch,
+  ServiceAuthError,
+  TRADE_EXECUTE_AUTH_KEY_FIELDS,
+  TELEGRAM_ALERT_AUTH_KEY_FIELDS,
+} from "@hoox-sh/hoox-shared/service-bindings";
 import {
   DISCLAIMER,
   DISCLAIMER_HEADER,
@@ -898,26 +903,25 @@ async function processTrade(
       test: test,
     };
 
-    const internalAuthKey = env.INTERNAL_KEY_BINDING;
-
     logger.info(
       `[${requestId}] Calling TRADE_SERVICE service binding with payload`,
       { payload: tradeWorkerPayload }
     );
+    // Fail-closed: never call trade without mesh auth. Prefer TRADE_EXECUTE
+    // key, fall back to INTERNAL_KEY_BINDING / AGENT_INTERNAL_KEY.
     // Forward gateway-resolved Idempotency-Key so trade-worker KV shares the
     // same logical key as the DO check (client key or auto fingerprint).
-    const response = await serviceFetch(
+    const response = await authenticatedServiceFetch(
       env.TRADE_SERVICE,
+      env,
       "/webhook",
       tradeWorkerPayload,
       {
         headers: {
           "X-Request-ID": requestId,
           "Idempotency-Key": idempotencyKey,
-          ...(internalAuthKey
-            ? { "X-Internal-Auth-Key": internalAuthKey as string }
-            : {}),
         },
+        internalKeyFields: TRADE_EXECUTE_AUTH_KEY_FIELDS,
       }
     );
 
@@ -970,6 +974,16 @@ async function processTrade(
       error: result.error ?? undefined,
     };
   } catch (error: unknown) {
+    if (error instanceof ServiceAuthError) {
+      logger.error(
+        `[${requestId}] TRADE_SERVICE auth misconfigured: ${error.message}`
+      );
+      return {
+        success: false,
+        requestId,
+        error: "Internal authentication key not configured.",
+      };
+    }
     const errorMsg = toError(error, "Unknown error calling trade service");
     logger.error(
       `[${requestId}] Exception calling TRADE_SERVICE: ${errorMsg}`,
@@ -1027,30 +1041,7 @@ async function processNotification(
       error: "Telegram service binding not available.",
     };
   }
-  if (!env.INTERNAL_KEY_BINDING) {
-    logger.error(
-      `[${requestId}] INTERNAL_KEY_BINDING is not configured for Telegram call auth.`
-    );
-    return {
-      success: false,
-      requestId,
-      error: "Internal authentication key not configured.",
-    };
-  }
-
   try {
-    const internalAuthKey = env.INTERNAL_KEY_BINDING;
-    if (!internalAuthKey) {
-      logger.error(
-        `[${requestId}] Failed to retrieve internal key from binding.`
-      );
-      return {
-        success: false,
-        requestId,
-        error: "Failed to retrieve internal authentication key.",
-      };
-    }
-
     // Construct the payload expected by telegram-worker's /process endpoint
     const payload = {
       requestId: requestId,
@@ -1061,12 +1052,13 @@ async function processNotification(
     };
 
     logger.info(`[${requestId}] Calling TELEGRAM_SERVICE service binding...`);
-    const response = await serviceFetch(
+    const response = await authenticatedServiceFetch(
       env.TELEGRAM_SERVICE,
+      env,
       "/process",
       payload,
       {
-        headers: { "X-Internal-Auth-Key": internalAuthKey as string },
+        internalKeyFields: TELEGRAM_ALERT_AUTH_KEY_FIELDS,
       }
     );
 
@@ -1093,6 +1085,16 @@ async function processNotification(
       error: result.error ?? undefined,
     };
   } catch (error: unknown) {
+    if (error instanceof ServiceAuthError) {
+      logger.error(
+        `[${requestId}] TELEGRAM_SERVICE auth misconfigured: ${error.message}`
+      );
+      return {
+        success: false,
+        requestId,
+        error: "Internal authentication key not configured.",
+      };
+    }
     const errorMsg = toError(error, "Unknown error calling telegram service");
     logger.error(
       `[${requestId}] Exception calling TELEGRAM_SERVICE: ${errorMsg}`,

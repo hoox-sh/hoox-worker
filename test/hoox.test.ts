@@ -407,15 +407,12 @@ describe("Hoox Worker Integration", () => {
     const response = await webhookReceiver.fetch(request, mockEnv, mockCtx());
     expect(response.status).toBe(500);
     const body = (await response.json()) as any;
-    // Check the combined error message structure - Only notify fails on key
-    expect(body.error).toBe(
-      "Processing failed: Internal authentication key not configured."
-    );
+    // Fail-closed mesh auth: both trade and notify require an internal key.
+    // authenticatedServiceFetch rejects before any service binding fetch.
+    expect(body.error).toContain("Internal authentication key not configured");
 
-    // Trade service might still be called successfully before notify fails
-    // expect(mockEnv.TRADE_SERVICE.fetch).not.toHaveBeenCalled();
-    expect(mockEnv.TELEGRAM_SERVICE.fetch).not.toHaveBeenCalled(); // Not called because internal key fetch failed first
-    // expect(fetchMock).not.toHaveBeenCalled();
+    expect(mockEnv.TRADE_SERVICE.fetch).not.toHaveBeenCalled();
+    expect(mockEnv.TELEGRAM_SERVICE.fetch).not.toHaveBeenCalled();
   });
 
   // --- Additions ---

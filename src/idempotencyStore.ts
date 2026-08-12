@@ -58,15 +58,17 @@ export class IdempotencyStore extends DurableObject {
 
   /**
    * Alarm handler — cleans up expired entries.
+   * Batch-deletes expired keys (single storage op) instead of sequential deletes.
    */
   async alarm(): Promise<void> {
     const all = await this.ctx.storage.list<StoredEntry>();
     const now = Date.now();
     let earliestRemaining = Infinity;
+    const expiredKeys: string[] = [];
 
     for (const [key, entry] of all) {
       if (now - entry.storedAt >= DEFAULT_TTL_MS) {
-        await this.ctx.storage.delete(key);
+        expiredKeys.push(key);
       } else {
         // Track earliest still-valid entry for next alarm
         const remaining = entry.storedAt + DEFAULT_TTL_MS - now;
@@ -74,6 +76,11 @@ export class IdempotencyStore extends DurableObject {
           earliestRemaining = remaining;
         }
       }
+    }
+
+    // DO storage.delete accepts a key array — one RMW instead of N sequential deletes
+    if (expiredKeys.length > 0) {
+      await this.ctx.storage.delete(expiredKeys);
     }
 
     // Schedule next alarm if there are still entries to expire
@@ -84,12 +91,22 @@ export class IdempotencyStore extends DurableObject {
 
   /**
    * Remove all stored keys (for testing/admin).
+   * Prefer deleteAll() so internal metadata and alarms are cleared as well
+   * (compat date ≥ 2026-02-24 deletes alarms with storage). Falls back to
+   * multi-key delete when deleteAll is unavailable (unit-test mocks).
    */
   async clear(): Promise<void> {
-    const all = await this.ctx.storage.list();
+    const storage = this.ctx.storage as DurableObjectStorage & {
+      deleteAll?: () => Promise<void>;
+    };
+    if (typeof storage.deleteAll === "function") {
+      await storage.deleteAll();
+      return;
+    }
+    const all = await storage.list();
     const keys = [...all.keys()];
     if (keys.length > 0) {
-      await this.ctx.storage.delete(keys);
+      await storage.delete(keys);
     }
   }
 }
