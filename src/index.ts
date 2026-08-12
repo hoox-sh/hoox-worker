@@ -14,7 +14,7 @@ import type {
 
 import { checkKillSwitch } from "./killSwitch";
 import { checkIpAllowlist } from "./ipAllowlist";
-import { getOrCreateSession } from "./sessionManager";
+import { deriveSessionId, getOrCreateSession } from "./sessionManager";
 import { IdempotencyStore } from "./idempotencyStore";
 import { checkRateLimit as kvRateLimit } from "./rateLimiter";
 import {
@@ -118,6 +118,8 @@ interface ServiceResponse {
   tradeResult?: unknown;
   notificationResult?: unknown;
   error?: string;
+  /** Optional HTTP status hint for handleRequest failure mapping. */
+  status?: number;
 }
 
 type HooxProcessRequestBody = ProcessRequestBody<{
@@ -478,16 +480,19 @@ async function handleRequest(
     // Remove the API key from the data before processing/forwarding
     delete data.apiKey;
 
+    // Hash API key before using as session/rate-limit identity (never store secrets as KV keys)
+    const sessionKey = await deriveSessionId(apiKey);
+
     // Session + queue mode in parallel (independent KV namespaces / keys)
     const [session, queueMode] = await Promise.all([
-      getOrCreateSession(env.SESSIONS_KV, apiKey),
+      getOrCreateSession(env.SESSIONS_KV, sessionKey),
       getQueueMode(env.CONFIG_KV),
     ]);
 
-    // Rate-limit by stable session key (apiKey-backed), NOT per-request UUID
+    // Rate-limit by stable hashed session key, NOT raw apiKey / per-request UUID
     if (!(await checkRateLimit(session.sessionId, env))) {
       logger.warn(
-        `[handleRequest] Rate limit exceeded for session ${session.sessionId.slice(0, 8)}…`
+        `[handleRequest] Rate limit exceeded for session ${session.sessionId.slice(0, 12)}…`
       );
       return wrapResponse(
         createJsonResponse(
@@ -693,7 +698,17 @@ async function handleRequest(
     const isDuplicate = errorMessages.some((m) =>
       m.toLowerCase().includes("duplicate")
     );
-    const status = isDuplicate ? 409 : 500;
+    const isUnavailable = errorMessages.some((m) =>
+      m.toLowerCase().includes("unavailable")
+    );
+    const hintedStatus =
+      tradeResult?.status &&
+      Number.isFinite(tradeResult.status) &&
+      tradeResult.status >= 400
+        ? tradeResult.status
+        : undefined;
+    const status =
+      hintedStatus ?? (isDuplicate ? 409 : isUnavailable ? 503 : 500);
     logger.info(
       `[handleRequest] Returning FAILURE response (status ${status}) for ${requestId}`
     );
@@ -765,23 +780,46 @@ function resolveIdempotencyKey(tradeData: TradeData): string {
   return generateIdempotencyKey(tradeData);
 }
 
+/** Fixed shard count for idempotency DOs — avoids one DO instance per unique key. */
+const IDEMPOTENCY_SHARD_COUNT = 16;
+
+/**
+ * Map an idempotency key to a stable DO shard name.
+ * Keys are stored inside the shard DO; the DO name is not the secret key itself.
+ */
+function idempotencyShardName(key: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  const shard = (h >>> 0) % IDEMPOTENCY_SHARD_COUNT;
+  return `idemp-shard-${shard}`;
+}
+
 /**
  * Check and store idempotency key using Durable Object.
  * Returns true if the key is new (proceed), false if duplicate.
+ *
+ * Fail-closed: missing DO or storage errors refuse the trade (503 path)
+ * rather than risking double fills under webhook retries.
  */
 async function checkIdempotency(env: Env, key: string): Promise<boolean> {
   if (!env.IDEMPOTENCY_STORE) {
-    return true; // No DO configured — cannot dedupe; allow (ops should bind DO in prod)
+    logger.error(
+      "[checkIdempotency] IDEMPOTENCY_STORE missing — refusing trade (fail-closed)"
+    );
+    throw new Error("IDEMPOTENCY_UNAVAILABLE");
   }
 
   try {
-    const id = env.IDEMPOTENCY_STORE.idFromName(key);
+    const id = env.IDEMPOTENCY_STORE.idFromName(idempotencyShardName(key));
     const stub = env.IDEMPOTENCY_STORE.get(id) as unknown as IdempotencyStore;
     return await stub.checkAndStore(key);
   } catch (error) {
     logger.error("[checkIdempotency] Error:", { error: toError(error) });
-    // Fail open on DO errors so a DO outage does not halt all trading.
-    return true;
+    // Fail closed — a DO outage must not allow duplicate fills
+    throw error instanceof Error ? error : new Error(String(error));
   }
 }
 
@@ -845,7 +883,19 @@ async function processTrade(
 
   // Check idempotency before processing (client key or auto fingerprint)
   const idempotencyKey = resolveIdempotencyKey(tradeData);
-  const isNew = await checkIdempotency(env, idempotencyKey);
+  let isNew: boolean;
+  try {
+    isNew = await checkIdempotency(env, idempotencyKey);
+  } catch (error: unknown) {
+    const msg = toError(error, "Idempotency check failed");
+    logger.error(`[${requestId}] Idempotency unavailable: ${msg}`);
+    return {
+      success: false,
+      requestId,
+      error: "Idempotency store unavailable. Trade refused (fail-closed).",
+      status: 503,
+    };
+  }
   if (!isNew) {
     logger.info(
       `[${requestId}] Duplicate trade detected, rejecting key prefix: ${idempotencyKey.slice(0, 48)}`
@@ -854,6 +904,7 @@ async function processTrade(
       success: false,
       requestId,
       error: "Duplicate trade request. This trade was already processed.",
+      status: 409,
     };
   }
 

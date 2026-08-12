@@ -29,22 +29,39 @@ export class IdempotencyStore extends DurableObject {
     key: string,
     ttlMs: number = DEFAULT_TTL_MS
   ): Promise<boolean> {
-    const existing = await this.ctx.storage.get<StoredEntry>(key);
-    if (existing && Date.now() - existing.storedAt < ttlMs) {
-      return false; // Duplicate — still within TTL window
+    // Defense-in-depth: serialize check+put against hibernation re-entry and
+    // any concurrent handlers that may share storage (Rules of Durable Objects).
+    // DO input-gate already serializes fetch handlers; blockConcurrencyWhile
+    // also covers constructor/alarm races with storage mutations.
+    const run = async (): Promise<boolean> => {
+      const existing = await this.ctx.storage.get<StoredEntry>(key);
+      if (existing && Date.now() - existing.storedAt < ttlMs) {
+        return false; // Duplicate — still within TTL window
+      }
+
+      // Store with current timestamp
+      await this.ctx.storage.put(key, { storedAt: Date.now() });
+
+      // Schedule alarm for TTL-based cleanup
+      const currentAlarm = await this.ctx.storage.getAlarm();
+      const nextCleanup = Date.now() + ttlMs;
+      if (!currentAlarm || nextCleanup < currentAlarm) {
+        await this.ctx.storage.setAlarm(nextCleanup);
+      }
+
+      return true;
+    };
+
+    const block = (
+      this.ctx as DurableObjectState & {
+        blockConcurrencyWhile?: <T>(fn: () => Promise<T>) => Promise<T>;
+      }
+    ).blockConcurrencyWhile;
+
+    if (typeof block === "function") {
+      return block.call(this.ctx, run);
     }
-
-    // Store with current timestamp
-    await this.ctx.storage.put(key, { storedAt: Date.now() });
-
-    // Schedule alarm for TTL-based cleanup
-    const currentAlarm = await this.ctx.storage.getAlarm();
-    const nextCleanup = Date.now() + ttlMs;
-    if (!currentAlarm || nextCleanup < currentAlarm) {
-      await this.ctx.storage.setAlarm(nextCleanup);
-    }
-
-    return true;
+    return run();
   }
 
   /**

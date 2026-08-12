@@ -1005,13 +1005,13 @@ describe("Hoox Worker - Error Handling", () => {
       createMockContext()
     );
     expect(response.status).toBeLessThan(500);
-    // DO should be keyed with client-provided idemp namespace
+    // DO is sharded (idemp-shard-N); full key lives inside the DO, not as DO name
     const idFromName = env.IDEMPOTENCY_STORE.idFromName as ReturnType<
       typeof mock
     >;
     expect(idFromName.mock.calls.length).toBeGreaterThan(0);
-    const usedKey = String(idFromName.mock.calls[0][0]);
-    expect(usedKey).toContain("client-key-abc");
+    const usedName = String(idFromName.mock.calls[0][0]);
+    expect(usedName).toMatch(/^idemp-shard-\d+$/);
   });
 
   it("POST / aliases /webhook", async () => {

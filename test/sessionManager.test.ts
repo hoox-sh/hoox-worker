@@ -4,7 +4,11 @@
  */
 
 import { describe, expect, test, beforeEach, jest } from "bun:test";
-import { getOrCreateSession, updateSession } from "../src/sessionManager";
+import {
+  deriveSessionId,
+  getOrCreateSession,
+  updateSession,
+} from "../src/sessionManager";
 
 describe("sessionManager", () => {
   let mockGet: jest.Mock;
@@ -13,6 +17,16 @@ describe("sessionManager", () => {
   beforeEach(() => {
     mockGet = jest.fn();
     mockPut = jest.fn();
+  });
+
+  test("deriveSessionId hashes secrets (never returns raw api key)", async () => {
+    const raw = "super-secret-webhook-api-key";
+    const id = await deriveSessionId(raw);
+    expect(id).not.toBe(raw);
+    expect(id.startsWith("sess:")).toBe(true);
+    expect(id.length).toBeGreaterThan(20);
+    // Stable for same input
+    expect(await deriveSessionId(raw)).toBe(id);
   });
 
   test("creates new session when KV undefined", async () => {

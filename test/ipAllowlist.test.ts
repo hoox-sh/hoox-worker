@@ -72,6 +72,29 @@ describe("ipAllowlist", () => {
     expect(result.allowed).toBe(true);
   });
 
+  test("rejects prototype-pollution style tokens in custom IP list", async () => {
+    mockGet
+      .mockResolvedValueOnce("true")
+      .mockResolvedValueOnce(
+        JSON.stringify(["__proto__", "constructor", "1.2.3.4"])
+      );
+    const kv = { get: mockGet } as any;
+    const result = await checkIpAllowlist(kv, "1.2.3.4");
+    expect(result.allowed).toBe(true);
+    expect(result.config.allowedIps.has("__proto__")).toBe(false);
+    expect(result.config.allowedIps.has("constructor")).toBe(false);
+  });
+
+  test("ignores non-array custom IP payloads", async () => {
+    mockGet
+      .mockResolvedValueOnce("true")
+      .mockResolvedValueOnce(JSON.stringify({ "1.2.3.4": true }));
+    const kv = { get: mockGet } as any;
+    // Falls back to TradingView defaults; custom IP not admitted
+    const result = await checkIpAllowlist(kv, "1.2.3.4");
+    expect(result.allowed).toBe(false);
+  });
+
   test("getDefaultAllowedIps returns default IPs", async () => {
     const defaultIps = getDefaultAllowedIps();
     expect(defaultIps.has("52.89.214.238")).toBe(true);

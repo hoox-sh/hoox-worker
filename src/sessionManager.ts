@@ -9,15 +9,34 @@ import { createLogger } from "@hoox-sh/hoox-shared/middleware";
 const logger = createLogger({ service: "hoox", module: "sessionManager" });
 
 const SESSION_TTL = 3600;
+const SESSION_KEY_PREFIX = "sess:";
 
 export interface SessionData {
   lastSeen: string;
+}
+
+/**
+ * Derive a non-reversible session identity from a secret (e.g. webhook API key).
+ * Never store secrets as KV key names — listings/exports would leak them.
+ */
+export async function deriveSessionId(
+  secretOrMaterial: string
+): Promise<string> {
+  const dig = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(secretOrMaterial)
+  );
+  const hex = [...new Uint8Array(dig)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `${SESSION_KEY_PREFIX}${hex}`;
 }
 
 export async function getOrCreateSession(
   kv: KVNamespace | undefined,
   sessionId?: string | null
 ): Promise<{ sessionId: string; isNew: boolean }> {
+  // Callers that pass secrets MUST hash first via deriveSessionId().
   const id = sessionId || crypto.randomUUID();
 
   if (!kv) {

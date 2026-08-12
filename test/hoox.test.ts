@@ -233,6 +233,13 @@ describe("Hoox Worker Integration", () => {
           new Response(JSON.stringify({ success: true }), { status: 200 })
         ),
     },
+    // Required for fail-closed idempotency — shard DO by name
+    IDEMPOTENCY_STORE: {
+      idFromName: jest.fn((name: string) => ({ name })),
+      get: jest.fn(() => ({
+        checkAndStore: jest.fn().mockResolvedValue(true),
+      })),
+    },
     SESSIONS_KV: {
       get: jest.fn().mockResolvedValue(null),
       put: jest.fn().mockResolvedValue(undefined),

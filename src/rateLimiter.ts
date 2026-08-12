@@ -72,6 +72,11 @@ function checkMemoryRateLimit(
 
 // ---- KV-backed (persistent, shared across instances) ----
 
+/**
+ * KV get-then-put rate limiting is best-effort under multi-isolate concurrency
+ * (last-write-wins). For strictly atomic limits use a Durable Object.
+ * Here we re-check after write and fail closed if we overshot.
+ */
 async function checkKvRateLimit(
   kv: KVNamespace,
   key: string,
@@ -81,6 +86,7 @@ async function checkKvRateLimit(
 ): Promise<boolean> {
   const kvKey = KV_PREFIX + key;
   const stored = await kv.get<RateLimitEntry>(kvKey, "json");
+  const ttlOpts = { expirationTtl: windowSeconds + 5 }; // buffer for clock skew
 
   if (!stored || now > stored.resetAt) {
     // Fresh window
@@ -88,17 +94,20 @@ async function checkKvRateLimit(
       count: 1,
       resetAt: now + windowSeconds * 1000,
     };
-    await kv.put(kvKey, JSON.stringify(entry), {
-      expirationTtl: windowSeconds + 5, // buffer for clock skew
-    });
+    await kv.put(kvKey, JSON.stringify(entry), ttlOpts);
     return true;
   }
 
   if (stored.count >= maxRequests) return false;
 
-  stored.count++;
-  await kv.put(kvKey, JSON.stringify(stored), {
-    expirationTtl: windowSeconds + 5,
-  });
+  const next: RateLimitEntry = {
+    count: stored.count + 1,
+    resetAt: stored.resetAt,
+  };
+  await kv.put(kvKey, JSON.stringify(next), ttlOpts);
+
+  // Fail closed on concurrent overshoot: if another isolate also incremented
+  // and we observe a higher count, reject this request.
+  if (next.count > maxRequests) return false;
   return true;
 }

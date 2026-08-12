@@ -18,6 +18,36 @@ const TRADINGVIEW_ALLOWED_IPS = new Set([
 const KV_IP_CHECK_ENABLED_KEY = "webhook:tradingview:ip_check_enabled";
 const KV_ALLOWED_IPS_KEY = "webhook:tradingview:allowed_ips";
 
+const MAX_CUSTOM_IPS = 500;
+const MAX_IP_LEN = 64;
+
+/**
+ * Runtime-validated custom allowlist from KV.
+ * Rejects non-arrays, oversized lists, non-string entries, and
+ * prototype-pollution style tokens (`__proto__`, `constructor`).
+ */
+function parseAllowedIps(raw: unknown): string[] | null {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_CUSTOM_IPS) {
+    return null;
+  }
+  const ips: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string") continue;
+    const ip = entry.trim();
+    if (
+      ip.length === 0 ||
+      ip.length > MAX_IP_LEN ||
+      ip.includes("__proto__") ||
+      ip.includes("constructor") ||
+      ip.includes("prototype")
+    ) {
+      continue;
+    }
+    ips.push(ip);
+  }
+  return ips.length > 0 ? ips : null;
+}
+
 export interface IpCheckConfig {
   enabled: boolean;
   allowedIps: Set<string>;
@@ -92,11 +122,12 @@ export async function loadIpConfig(
 
     if (customIpsStr) {
       try {
-        const customIps = JSON.parse(customIpsStr);
-        if (Array.isArray(customIps) && customIps.length > 0) {
-          allowedIps = new Set(
-            customIps.filter((ip): ip is string => typeof ip === "string")
-          );
+        const raw: unknown = JSON.parse(customIpsStr);
+        const parsed = parseAllowedIps(raw);
+        if (parsed) {
+          allowedIps = new Set(parsed);
+        } else {
+          logger.error("Invalid IP allowlist payload in KV (ignored)");
         }
       } catch (parseError) {
         logger.error("Error parsing IP config JSON from KV", {
