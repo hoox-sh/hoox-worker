@@ -532,8 +532,20 @@ async function handleRequest(
         ? bodyIdempotencyKey
         : headerIdempotencyKey || undefined;
 
-    // Process trading signal if any trade field is present (strict validation)
-    let tradeResult: ServiceResponse | null = null;
+    // Validate trade + notify first, then run independent I/O in parallel
+    let tradeWork:
+      | {
+          requestId: string;
+          exchange: string;
+          action: WebhookPayload["action"];
+          symbol: string;
+          quantity: number;
+          price?: number;
+          leverage?: number;
+          test?: boolean;
+          idempotencyKey?: string;
+        }
+      | null = null;
     if (hasTradeIntent(data)) {
       // Normalize action case before schema validation
       const normalizedAction =
@@ -560,32 +572,20 @@ async function handleRequest(
         );
       }
       const v = validation.value;
-      tradeResult = await processTrade(
-        {
-          requestId,
-          exchange: v.exchange,
-          action: v.action,
-          symbol: v.symbol,
-          quantity: v.quantity,
-          price: v.price,
-          leverage: v.leverage,
-          test: v.test,
-          idempotencyKey: clientIdempotencyKey,
-        },
-        env,
-        queueMode
-      );
-      if (!tradeResult?.success) {
-        overallSuccess = false;
-        errorMessages.push(tradeResult?.error || "Trade processing failed");
-        logger.error(`Trade processing failed for ${requestId}`, {
-          error: tradeResult?.error,
-        });
-      }
+      tradeWork = {
+        requestId,
+        exchange: v.exchange,
+        action: v.action,
+        symbol: v.symbol,
+        quantity: v.quantity,
+        price: v.price,
+        leverage: v.leverage,
+        test: v.test,
+        idempotencyKey: clientIdempotencyKey,
+      };
     }
 
-    // Process notification if requested
-    let notificationResult: ServiceResponse | null = null;
+    let notifyWork: NotificationData | null = null;
     if (notify !== undefined && notify !== null) {
       // Reject non-plain objects (arrays, Date, RegExp, primitives, etc.)
       if (
@@ -622,27 +622,42 @@ async function handleRequest(
           )
         );
       }
-      notificationResult = await processNotification(
-        {
-          requestId,
-          message:
-            typeof notifyPayload.message === "string" &&
-            notifyPayload.message.length > 0
-              ? notifyPayload.message
-              : createDefaultMessage(data),
-          chatId: chatIdRaw as string | number,
-        },
-        env
+      notifyWork = {
+        requestId,
+        message:
+          typeof notifyPayload.message === "string" &&
+          notifyPayload.message.length > 0
+            ? notifyPayload.message
+            : createDefaultMessage(data),
+        chatId: chatIdRaw as string | number,
+      };
+    }
+
+    // Parallelize independent service-binding work (trade ⊥ notify)
+    const [tradeResult, notificationResult] = await Promise.all([
+      tradeWork
+        ? processTrade(tradeWork, env, queueMode)
+        : Promise.resolve(null as ServiceResponse | null),
+      notifyWork
+        ? processNotification(notifyWork, env)
+        : Promise.resolve(null as ServiceResponse | null),
+    ]);
+
+    if (tradeWork && !tradeResult?.success) {
+      overallSuccess = false;
+      errorMessages.push(tradeResult?.error || "Trade processing failed");
+      logger.error(`Trade processing failed for ${requestId}`, {
+        error: tradeResult?.error,
+      });
+    }
+    if (notifyWork && !notificationResult?.success) {
+      overallSuccess = false;
+      errorMessages.push(
+        notificationResult?.error || "Notification processing failed"
       );
-      if (!notificationResult?.success) {
-        overallSuccess = false;
-        errorMessages.push(
-          notificationResult?.error || "Notification processing failed"
-        );
-        logger.error(`Notification processing failed for ${requestId}`, {
-          error: notificationResult?.error,
-        });
-      }
+      logger.error(`Notification processing failed for ${requestId}`, {
+        error: notificationResult?.error,
+      });
     }
 
     if (!hasTradeIntent(data) && !notify) {
