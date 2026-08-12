@@ -65,7 +65,11 @@ export class RateLimiterStore extends DurableObject {
     ).blockConcurrencyWhile;
 
     if (typeof block === "function") {
-      return block.call(this.ctx, run);
+      // Bind preserves `this`; avoid `.call` which widens Promise<T> → unknown under tsc.
+      const runBlocked = block.bind(this.ctx) as <U>(
+        cb: () => Promise<U>
+      ) => Promise<U>;
+      return runBlocked(run);
     }
     return run();
   }

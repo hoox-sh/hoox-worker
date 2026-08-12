@@ -214,7 +214,11 @@ export class IdempotencyStore extends DurableObject {
     ).blockConcurrencyWhile;
 
     if (typeof block === "function") {
-      return block.call(this.ctx, fn);
+      // Bind preserves `this`; avoid `.call` which widens Promise<T> → unknown under tsc.
+      const runBlocked = block.bind(this.ctx) as <U>(
+        cb: () => Promise<U>
+      ) => Promise<U>;
+      return runBlocked(fn);
     }
     return fn();
   }
