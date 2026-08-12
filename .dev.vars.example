@@ -4,6 +4,11 @@ WEBHOOK_API_KEY_BINDING=your_api_secret_key_here
 TRADE_SERVICE=http://localhost:8788
 TELEGRAM_SERVICE=http://localhost:8790
 
+# Notify chatId allowlist (fail-closed when unset). Comma-separated.
+# Also: CONFIG_KV key telegram:allowed_chat_ids as JSON array ["123","-100..."]
+TELEGRAM_ALLOWED_CHAT_IDS=123456789
+# AUTHORIZED_CHAT_IDS=123456789
+
 # Note: This file provides example values for local development.
 # Copy this file to .dev.vars and replace with your actual values.
-# .dev.vars is ignored by git to prevent committing sensitive information. 
+# .dev.vars is ignored by git to prevent committing sensitive information.

@@ -46,6 +46,12 @@
     // HA_TOKEN: Home Assistant access token (optional)
     // Set via: wrangler secret put HA_TOKEN_BINDING
     "HA_TOKEN_BINDING": null,
+    // TELEGRAM_ALLOWED_CHAT_IDS: comma-separated chat IDs allowed for webhook
+    // notify payloads. Fail-closed: notify is rejected when unset.
+    // Also readable from CONFIG_KV key `telegram:allowed_chat_ids` (JSON array).
+    // Alias: AUTHORIZED_CHAT_IDS (same shape as telegram-worker).
+    // Set via: wrangler secret put TELEGRAM_ALLOWED_CHAT_IDS
+    // "TELEGRAM_ALLOWED_CHAT_IDS": "123456789,-1001234567890",
   },
 
   // SERVICES: Service bindings to other workers

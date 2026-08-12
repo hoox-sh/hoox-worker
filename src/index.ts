@@ -14,6 +14,10 @@ import type {
 
 import { checkKillSwitch } from "./killSwitch";
 import { checkIpAllowlist } from "./ipAllowlist";
+import {
+  checkChatIdAllowlist,
+  type ChatIdAllowlistEnv,
+} from "./chatIdAllowlist";
 import { deriveSessionId, getOrCreateSession } from "./sessionManager";
 import { IdempotencyStore } from "./idempotencyStore";
 import { RateLimiterStore } from "./rateLimiterStore";
@@ -29,6 +33,7 @@ import {
   validateJson,
   requireOperatorAuth,
   timingSafeEqual,
+  safeWaitUntil,
 } from "@hoox-sh/hoox-shared/middleware";
 import { createRouter } from "@hoox-sh/hoox-shared/router";
 import {
@@ -67,10 +72,14 @@ const MAX_IDEMPOTENCY_KEY_LEN = 256;
 
 /**
  * Worker env is the wrangler-generated Cloudflare.Env surface.
- * Optional secrets used by operator routes (OPERATOR_API_KEY) are read
- * dynamically so we do not fight generated required bindings.
+ * Optional secrets used by operator routes (OPERATOR_API_KEY) and notify
+ * chat allowlist (TELEGRAM_ALLOWED_CHAT_IDS / AUTHORIZED_CHAT_IDS) are
+ * read as optional so we do not fight generated required bindings.
  */
-type Env = Cloudflare.Env;
+type Env = Cloudflare.Env &
+  ChatIdAllowlistEnv & {
+    OPERATOR_API_KEY?: string;
+  };
 
 // --- Other interfaces (WebhookData, TradeData, etc.) remain the same ---
 // ... existing interfaces ...
@@ -588,6 +597,8 @@ async function handleRequest(
     }
 
     let notifyWork: NotificationData | null = null;
+    /** Pre-computed notify failure (allowlist / format) — trade may still run. */
+    let notifyBlocked: ServiceResponse | null = null;
     if (notify !== undefined && notify !== null) {
       // Reject non-plain objects (arrays, Date, RegExp, primitives, etc.)
       if (
@@ -610,33 +621,47 @@ async function handleRequest(
         chatId?: unknown;
       };
       const chatIdRaw = notifyPayload.chatId;
-      const chatIdValid =
-        (typeof chatIdRaw === "string" && chatIdRaw.length > 0) ||
-        (typeof chatIdRaw === "number" && Number.isFinite(chatIdRaw));
-      if (!chatIdValid) {
-        return wrapResponse(
-          createJsonResponse(
-            {
-              success: false,
-              error: "Invalid notify payload: chatId is required",
-            },
-            400
-          )
-        );
+      // Fail-closed allowlist: unconfigured or non-matching chatId rejects
+      // notify only (trade path still proceeds when present).
+      const chatCheck = await checkChatIdAllowlist(chatIdRaw, env);
+      if (!chatCheck.allowed) {
+        const status = chatCheck.normalized ? 403 : 400;
+        const error =
+          chatCheck.reason ??
+          (chatCheck.normalized
+            ? "chatId not in notify allowlist"
+            : "Invalid notify payload: chatId is required");
+        // Notify-only request → hard fail with client status
+        if (!tradeWork) {
+          return wrapResponse(
+            createJsonResponse({ success: false, error, requestId }, status)
+          );
+        }
+        // Combined trade+notify: block notify, continue trade
+        notifyBlocked = {
+          success: false,
+          requestId,
+          error,
+          status,
+        };
+        logger.warn(`[${requestId}] notify blocked by chatId allowlist`, {
+          error,
+        });
+      } else {
+        notifyWork = {
+          requestId,
+          message:
+            typeof notifyPayload.message === "string" &&
+            notifyPayload.message.length > 0
+              ? notifyPayload.message
+              : createDefaultMessage(data),
+          chatId: chatCheck.normalized as string,
+        };
       }
-      notifyWork = {
-        requestId,
-        message:
-          typeof notifyPayload.message === "string" &&
-          notifyPayload.message.length > 0
-            ? notifyPayload.message
-            : createDefaultMessage(data),
-        chatId: chatIdRaw as string | number,
-      };
     }
 
     // Parallelize independent service-binding work (trade ⊥ notify)
-    const [tradeResult, notificationResult] = await Promise.all([
+    const [tradeResult, notificationResultRaw] = await Promise.all([
       tradeWork
         ? processTrade(tradeWork, env, queueMode)
         : Promise.resolve(null as ServiceResponse | null),
@@ -644,6 +669,7 @@ async function handleRequest(
         ? processNotification(notifyWork, env)
         : Promise.resolve(null as ServiceResponse | null),
     ]);
+    const notificationResult = notifyBlocked ?? notificationResultRaw;
 
     if (tradeWork && !tradeResult?.success) {
       overallSuccess = false;
@@ -652,13 +678,17 @@ async function handleRequest(
         error: tradeResult?.error,
       });
     }
-    if (notifyWork && !notificationResult?.success) {
+    if (
+      (notifyWork || notifyBlocked) &&
+      notificationResult &&
+      !notificationResult.success
+    ) {
       overallSuccess = false;
       errorMessages.push(
-        notificationResult?.error || "Notification processing failed"
+        notificationResult.error || "Notification processing failed"
       );
       logger.error(`Notification processing failed for ${requestId}`, {
-        error: notificationResult?.error,
+        error: notificationResult.error,
       });
     }
 
@@ -677,13 +707,15 @@ async function handleRequest(
 
     // Track webhook API call (fire-and-forget)
     const latencyMs = Date.now() - startTime;
-    ctx.waitUntil(
+    safeWaitUntil(
+      ctx,
       trackAnalytics(env as AnalyticsEnv, "/track/api-call", {
         worker: "hoox",
         endpoint: "/webhook",
         latencyMs,
         success: overallSuccess,
-      })
+      }),
+      (err) => logger.error("trackAnalytics failed", { error: String(err) })
     );
 
     const tradeQueued =
@@ -718,12 +750,20 @@ async function handleRequest(
     const isUnavailable = errorMessages.some((m) =>
       m.toLowerCase().includes("unavailable")
     );
-    const hintedStatus =
+    const tradeHint =
       tradeResult?.status &&
       Number.isFinite(tradeResult.status) &&
       tradeResult.status >= 400
         ? tradeResult.status
         : undefined;
+    const notifyHint =
+      notificationResult?.status &&
+      Number.isFinite(notificationResult.status) &&
+      notificationResult.status >= 400
+        ? notificationResult.status
+        : undefined;
+    // Prefer more specific client errors; trade hint wins when both present
+    const hintedStatus = tradeHint ?? notifyHint;
     const status =
       hintedStatus ?? (isDuplicate ? 409 : isUnavailable ? 503 : 500);
     logger.info(

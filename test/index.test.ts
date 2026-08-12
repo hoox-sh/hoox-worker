@@ -65,6 +65,8 @@ function createMockEnv(overrides: Partial<MockEnv> = {}): MockEnv {
     WEBHOOK_API_KEY_BINDING: "test-api-key",
     INTERNAL_KEY_BINDING: "test-internal-key",
     OPERATOR_API_KEY: "test-operator-key",
+    // Fail-closed notify allowlist — include chatIds used by notify fixtures
+    TELEGRAM_ALLOWED_CHAT_IDS: "123456,123456789",
     CONFIG_KV: createMockKV(),
     SESSIONS_KV: createMockKV(),
     TRADE_SERVICE: createMockServiceBinding(),
@@ -1008,6 +1010,130 @@ describe("Hoox Worker - Event Processing", () => {
 
     const response = await webhookReceiver.fetch(request, env, ctx);
     expect(response.status).toBeLessThan(500);
+  });
+
+  it("allows notify when chatId is on TELEGRAM_ALLOWED_CHAT_IDS", async () => {
+    const request = new Request("https://example.com/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "52.89.214.238",
+      },
+      body: JSON.stringify({
+        apiKey: "test-api-key",
+        notify: { message: "hello", chatId: "123456" },
+      }),
+    });
+    const env = createMockEnv({ TELEGRAM_ALLOWED_CHAT_IDS: "123456" });
+    const response = await webhookReceiver.fetch(
+      request,
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(200);
+    expect(env.TELEGRAM_SERVICE?.fetch).toHaveBeenCalled();
+  });
+
+  it("denies notify when chatId is not on allowlist (notify-only → 403)", async () => {
+    const request = new Request("https://example.com/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "52.89.214.238",
+      },
+      body: JSON.stringify({
+        apiKey: "test-api-key",
+        notify: { message: "spam", chatId: "999999" },
+      }),
+    });
+    const env = createMockEnv({ TELEGRAM_ALLOWED_CHAT_IDS: "123456" });
+    const response = await webhookReceiver.fetch(
+      request,
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(403);
+    const body = (await response.json()) as { error?: string };
+    expect(body.error).toMatch(/not in notify allowlist/i);
+    expect(env.TELEGRAM_SERVICE?.fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects notify when allowlist is not configured (fail-closed)", async () => {
+    const request = new Request("https://example.com/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "52.89.214.238",
+      },
+      body: JSON.stringify({
+        apiKey: "test-api-key",
+        notify: { message: "hello", chatId: "123456" },
+      }),
+    });
+    const env = createMockEnv({ TELEGRAM_ALLOWED_CHAT_IDS: undefined });
+    delete env.TELEGRAM_ALLOWED_CHAT_IDS;
+    const response = await webhookReceiver.fetch(
+      request,
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(403);
+    const body = (await response.json()) as { error?: string };
+    expect(body.error).toMatch(/allowlist not configured/i);
+    expect(env.TELEGRAM_SERVICE?.fetch).not.toHaveBeenCalled();
+  });
+
+  it("blocks notify but still runs trade when chatId denied", async () => {
+    const request = new Request("https://example.com/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "52.89.214.238",
+      },
+      body: JSON.stringify({
+        ...validPayload,
+        notify: { message: "spam", chatId: "999999" },
+      }),
+    });
+    const env = createMockEnv({ TELEGRAM_ALLOWED_CHAT_IDS: "123456" });
+    const response = await webhookReceiver.fetch(
+      request,
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(403);
+    expect(env.TRADE_SERVICE?.fetch).toHaveBeenCalled();
+    expect(env.TELEGRAM_SERVICE?.fetch).not.toHaveBeenCalled();
+    const body = (await response.json()) as {
+      success: boolean;
+      tradeResult?: { success?: boolean } | null;
+      notificationResult?: { success?: boolean; error?: string } | null;
+    };
+    expect(body.success).toBe(false);
+    expect(body.tradeResult?.success).toBe(true);
+    expect(body.notificationResult?.success).toBe(false);
+  });
+
+  it("rejects path-injection chatId with 400", async () => {
+    const request = new Request("https://example.com/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "52.89.214.238",
+      },
+      body: JSON.stringify({
+        apiKey: "test-api-key",
+        notify: { message: "x", chatId: "../etc/passwd" },
+      }),
+    });
+    const env = createMockEnv({ TELEGRAM_ALLOWED_CHAT_IDS: "123456" });
+    const response = await webhookReceiver.fetch(
+      request,
+      env as any,
+      createMockContext()
+    );
+    expect(response.status).toBe(400);
+    expect(env.TELEGRAM_SERVICE?.fetch).not.toHaveBeenCalled();
   });
 });
 

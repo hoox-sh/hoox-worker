@@ -219,6 +219,11 @@ describe("Hoox Worker Integration", () => {
       secrets.internalKey !== undefined
         ? secrets.internalKey
         : TEST_INTERNAL_KEY,
+    // Fail-closed notify allowlist — matches chatId 123456789 in fixtures
+    TELEGRAM_ALLOWED_CHAT_IDS:
+      secrets.allowedChatIds !== undefined
+        ? secrets.allowedChatIds
+        : "123456789,123456",
     TRADE_SERVICE: {
       fetch: jest
         .fn()

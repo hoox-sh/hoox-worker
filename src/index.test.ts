@@ -65,6 +65,8 @@ function createMockEnv(overrides: Partial<MockEnv> = {}): MockEnv {
     WEBHOOK_API_KEY_BINDING: "test-api-key",
     INTERNAL_KEY_BINDING: "test-internal-key",
     OPERATOR_API_KEY: "test-operator-key",
+    // Fail-closed notify allowlist — include chatIds used by notify fixtures
+    TELEGRAM_ALLOWED_CHAT_IDS: "123456,123456789",
     CONFIG_KV: createMockKV(),
     SESSIONS_KV: createMockKV(),
     TRADE_SERVICE: createMockServiceBinding(),
