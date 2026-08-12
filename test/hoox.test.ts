@@ -237,7 +237,17 @@ describe("Hoox Worker Integration", () => {
     IDEMPOTENCY_STORE: {
       idFromName: jest.fn((name: string) => ({ name })),
       get: jest.fn(() => ({
+        reserve: jest.fn().mockResolvedValue({ ok: true, status: "new" }),
+        commit: jest.fn().mockResolvedValue(undefined),
+        release: jest.fn().mockResolvedValue(undefined),
         checkAndStore: jest.fn().mockResolvedValue(true),
+      })),
+    },
+    // Atomic rate limit DO (falls back to KV/memory if omitted)
+    RATE_LIMITER: {
+      idFromName: jest.fn((name: string) => ({ name })),
+      get: jest.fn(() => ({
+        checkAndIncrement: jest.fn().mockResolvedValue(true),
       })),
     },
     SESSIONS_KV: {
@@ -616,6 +626,9 @@ describe("Hoox Worker - Queue Integration", () => {
     IDEMPOTENCY_STORE: {
       newUniqueId: jest.fn().mockReturnValue({}),
       get: jest.fn().mockResolvedValue({
+        reserve: jest.fn().mockResolvedValue({ ok: true, status: "new" }),
+        commit: jest.fn().mockResolvedValue(undefined),
+        release: jest.fn().mockResolvedValue(undefined),
         checkAndStore: jest.fn().mockResolvedValue(true),
       }),
     },
@@ -660,6 +673,9 @@ describe("Hoox Worker - Durable Objects (Idempotency)", () => {
     IDEMPOTENCY_STORE: {
       newUniqueId: jest.fn().mockReturnValue({ id: "test-id" }),
       get: jest.fn().mockResolvedValue({
+        reserve: jest.fn().mockResolvedValue({ ok: true, status: "new" }),
+        commit: jest.fn().mockResolvedValue(undefined),
+        release: jest.fn().mockResolvedValue(undefined),
         checkAndStore: jest.fn().mockResolvedValue(true),
         initialize: jest.fn().mockResolvedValue(undefined),
       }),
@@ -676,7 +692,13 @@ describe("Hoox Worker - Durable Objects (Idempotency)", () => {
     expect(id).toBeDefined();
   });
 
-  test("should check and store idempotency key", async () => {
+  test("should reserve idempotency key", async () => {
+    const store = await mockEnv.IDEMPOTENCY_STORE.get({ id: "test" });
+    const result = await store.reserve("trade:binance:BTCUSDT:LONG:0.01");
+    expect(result).toEqual({ ok: true, status: "new" });
+  });
+
+  test("should check and store idempotency key (legacy)", async () => {
     const store = await mockEnv.IDEMPOTENCY_STORE.get({ id: "test" });
     const result = await store.checkAndStore("trade:binance:BTCUSDT:LONG:0.01");
     expect(result).toBe(true);

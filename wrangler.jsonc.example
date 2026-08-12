@@ -109,7 +109,7 @@
     ]
   },
 
-  // DURABLE_OBJECTS: For idempotency (duplicate trade prevention)
+  // DURABLE_OBJECTS: idempotency + atomic trade rate limiting
   "durable_objects": {
     "bindings": [
       {
@@ -117,6 +117,12 @@
         "name": "IDEMPOTENCY_STORE",
         // CLASS_NAME: Durable Object class (must match DO class name)
         "class_name": "IdempotencyStore"
+      },
+      {
+        // Atomic multi-isolate rate limits (trade path MAX_TRADES_PER_MINUTE)
+        // Without this binding, gateway falls back to CONFIG_KV / in-memory
+        "name": "RATE_LIMITER",
+        "class_name": "RateLimiterStore"
       }
     ]
   },
@@ -127,6 +133,12 @@
       "tag": "v1",
       "new_sqlite_classes": [
         "IdempotencyStore"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "RateLimiterStore"
       ]
     }
   ]

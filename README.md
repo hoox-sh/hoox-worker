@@ -13,7 +13,7 @@ The **hoox-worker** (Cloudflare service name: `hoox`) is the only public signal 
 
 1. **Authenticate** inbound webhooks (API key / shared secret headers).
 2. **Authorize** source IPs when TradingView allowlisting is enabled.
-3. **Rate-limit** noisy or abusive senders (KV-backed counters).
+3. **Rate-limit** noisy or abusive senders (atomic Durable Object when bound; else KV / memory).
 4. **Idempotency** — Durable Objects store request fingerprints so duplicate alerts never double-fill.
 5. **Kill switch** — when agent-worker (or operators) flip the global breaker, the gateway drops new signals until reset.
 6. **Dispatch** — successful signals go to [trade-worker](https://github.com/hoox-sh/trade-worker) via Service Binding and/or the `trade-execution` queue; telemetry fans into [analytics-worker](https://github.com/hoox-sh/analytics-worker); optional operator alerts go to [telegram-worker](https://github.com/hoox-sh/telegram-worker).
@@ -44,8 +44,9 @@ TradingView / webhooks
 | `GET`  | `/v1/health`, `/v1/workers`, SSE streams | Bearer `OPERATOR_API_KEY` | Operator management plane |
 | `GET`  | `/v1/trades/stream`, `/v1/logs/stream` | Bearer `OPERATOR_API_KEY` | Long-lived SSE; polls trade-worker `/api/signals` & `/api/system-logs` |
 | DO     | `IdempotencyStore` | Internal | Deduplicate trade traces |
+| DO     | `RateLimiterStore` | Internal | Atomic per-session trade rate limits |
 
-**Ingress controls (webhook):** kill switch (`trade:kill_switch` \| `global:kill_switch` → 503), TradingView IP allowlist, 64 KiB body cap, session rate limit (10/min), DO idempotency (body/`Idempotency-Key` or auto fingerprint).
+**Ingress controls (webhook):** kill switch (`trade:kill_switch` \| `global:kill_switch` → 503), TradingView IP allowlist, 64 KiB body cap, session rate limit (10/min via `RATE_LIMITER` DO or KV fallback), DO idempotency (body/`Idempotency-Key` or auto fingerprint).
 
 ### CLI
 

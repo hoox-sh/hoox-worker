@@ -34,6 +34,7 @@ interface MockEnv {
   TELEGRAM_SERVICE?: any;
   TRADE_QUEUE?: any;
   IDEMPOTENCY_STORE?: any;
+  RATE_LIMITER?: any;
   [key: string]: any;
 }
 
@@ -74,7 +75,16 @@ function createMockEnv(overrides: Partial<MockEnv> = {}): MockEnv {
     IDEMPOTENCY_STORE: {
       idFromName: mock((name: string) => ({ name })),
       get: mock(() => ({
+        reserve: mock(async () => ({ ok: true, status: "new" as const })),
+        commit: mock(async () => undefined),
+        release: mock(async () => undefined),
         checkAndStore: mock(async () => true),
+      })),
+    },
+    RATE_LIMITER: {
+      idFromName: mock((name: string) => ({ name })),
+      get: mock(() => ({
+        checkAndIncrement: mock(async () => true),
       })),
     },
     ...overrides,

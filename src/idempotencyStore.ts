@@ -7,75 +7,144 @@ import { DurableObject } from "cloudflare:workers";
 
 const DEFAULT_TTL_MS = 300_000; // 5 minutes
 
+/** Entry status: pending = reserved in-flight; committed = execution accepted. */
+export type IdempotencyStatus = "pending" | "committed";
+
 interface StoredEntry {
   storedAt: number;
+  status: IdempotencyStatus;
+  /** Absolute expiry time (ms since epoch). Alarm and reserve use this for TTL. */
+  expiresAt: number;
 }
+
+export type ReserveResult =
+  | { ok: true; status: "new" }
+  | { ok: false; status: "duplicate" };
 
 /**
  * IdempotencyStore — Durable Object for exactly-once trade execution.
  *
- * Prevents duplicate trade submissions within a configurable TTL window.
- * Uses DO SQLite-backed storage for persistence and alarm-based cleanup.
+ * Two-phase protocol:
+ *   reserve → (execute) → commit on success | release on hard failure
+ *
+ * Pending keys block concurrent in-flight retries; committed keys block
+ * re-execution within the TTL. Release deletes the key so retries can proceed
+ * when the first attempt never successfully queued/executed.
  */
 export class IdempotencyStore extends DurableObject {
   /**
-   * Check if a key is new (not recently seen) and store it atomically.
+   * Reserve an idempotency key (phase 1).
    *
-   * @param key  — Unique idempotency key (e.g. "trade:binance:BTCUSDT:LONG:0.01")
-   * @param ttlMs — Time-to-live in milliseconds (default 5 min)
+   * - committed within TTL → duplicate
+   * - pending within TTL → duplicate (in-flight)
+   * - else put { status: "pending", expiresAt }, schedule alarm
+   */
+  async reserve(
+    key: string,
+    ttlMs: number = DEFAULT_TTL_MS
+  ): Promise<ReserveResult> {
+    const run = async (): Promise<ReserveResult> => {
+      const now = Date.now();
+      const existing = await this.ctx.storage.get<StoredEntry>(key);
+
+      if (existing && now < entryExpiresAt(existing)) {
+        return { ok: false, status: "duplicate" };
+      }
+
+      const expiresAt = now + ttlMs;
+      await this.ctx.storage.put(key, {
+        storedAt: now,
+        status: "pending" as const,
+        expiresAt,
+      } satisfies StoredEntry);
+
+      await this.scheduleAlarm(expiresAt);
+      return { ok: true, status: "new" };
+    };
+
+    return this.withConcurrencyBlock(run);
+  }
+
+  /**
+   * Commit a previously reserved key (phase 2 success).
+   * Marks the entry committed and refreshes storedAt; keeps expiresAt.
+   */
+  async commit(key: string): Promise<void> {
+    const run = async (): Promise<void> => {
+      const existing = await this.ctx.storage.get<StoredEntry>(key);
+      if (!existing) return;
+
+      const now = Date.now();
+      // If already past TTL, drop instead of extending a stale reservation.
+      if (now >= entryExpiresAt(existing)) {
+        await this.ctx.storage.delete(key);
+        return;
+      }
+
+      await this.ctx.storage.put(key, {
+        storedAt: now,
+        status: "committed" as const,
+        expiresAt: entryExpiresAt(existing),
+      } satisfies StoredEntry);
+    };
+
+    return this.withConcurrencyBlock(run);
+  }
+
+  /**
+   * Release a reserved key (phase 2 hard failure).
+   * Deletes the key so retries can reserve again.
+   */
+  async release(key: string): Promise<void> {
+    const run = async (): Promise<void> => {
+      await this.ctx.storage.delete(key);
+    };
+    return this.withConcurrencyBlock(run);
+  }
+
+  /**
+   * Legacy single-phase API: reserve + commit atomically.
+   * Kept for tests and any callers that have not migrated.
+   *
    * @returns `true` if the key was stored (new request), `false` if duplicate
    */
   async checkAndStore(
     key: string,
     ttlMs: number = DEFAULT_TTL_MS
   ): Promise<boolean> {
-    // Defense-in-depth: serialize check+put against hibernation re-entry and
-    // any concurrent handlers that may share storage (Rules of Durable Objects).
-    // DO input-gate already serializes fetch handlers; blockConcurrencyWhile
-    // also covers constructor/alarm races with storage mutations.
     const run = async (): Promise<boolean> => {
+      const now = Date.now();
       const existing = await this.ctx.storage.get<StoredEntry>(key);
-      if (existing && Date.now() - existing.storedAt < ttlMs) {
-        return false; // Duplicate — still within TTL window
+      if (existing && now < entryExpiresAt(existing)) {
+        return false;
       }
 
-      // Store with current timestamp
-      await this.ctx.storage.put(key, { storedAt: Date.now() });
+      const expiresAt = now + ttlMs;
+      await this.ctx.storage.put(key, {
+        storedAt: now,
+        status: "committed" as const,
+        expiresAt,
+      } satisfies StoredEntry);
 
-      // Schedule alarm for TTL-based cleanup
-      const currentAlarm = await this.ctx.storage.getAlarm();
-      const nextCleanup = Date.now() + ttlMs;
-      if (!currentAlarm || nextCleanup < currentAlarm) {
-        await this.ctx.storage.setAlarm(nextCleanup);
-      }
-
+      await this.scheduleAlarm(expiresAt);
       return true;
     };
 
-    const block = (
-      this.ctx as DurableObjectState & {
-        blockConcurrencyWhile?: <T>(fn: () => Promise<T>) => Promise<T>;
-      }
-    ).blockConcurrencyWhile;
-
-    if (typeof block === "function") {
-      return block.call(this.ctx, run);
-    }
-    return run();
+    return this.withConcurrencyBlock(run);
   }
 
   /**
-   * Check whether a previously stored key has expired.
+   * Check whether a previously stored key has expired (or is missing).
    */
   async expired(key: string): Promise<boolean> {
     const entry = await this.ctx.storage.get<StoredEntry>(key);
     if (!entry) return true;
-    return Date.now() - entry.storedAt >= DEFAULT_TTL_MS;
+    return Date.now() >= entryExpiresAt(entry);
   }
 
   /**
-   * Alarm handler — cleans up expired entries.
-   * Batch-deletes expired keys (single storage op) instead of sequential deletes.
+   * Alarm handler — cleans up expired pending and committed entries.
+   * Uses each entry's expiresAt so custom TTLs are respected.
    */
   async alarm(): Promise<void> {
     const all = await this.ctx.storage.list<StoredEntry>();
@@ -84,23 +153,21 @@ export class IdempotencyStore extends DurableObject {
     const expiredKeys: string[] = [];
 
     for (const [key, entry] of all) {
-      if (now - entry.storedAt >= DEFAULT_TTL_MS) {
+      const expiresAt = entryExpiresAt(entry);
+      if (now >= expiresAt) {
         expiredKeys.push(key);
       } else {
-        // Track earliest still-valid entry for next alarm
-        const remaining = entry.storedAt + DEFAULT_TTL_MS - now;
+        const remaining = expiresAt - now;
         if (remaining < earliestRemaining) {
           earliestRemaining = remaining;
         }
       }
     }
 
-    // DO storage.delete accepts a key array — one RMW instead of N sequential deletes
     if (expiredKeys.length > 0) {
       await this.ctx.storage.delete(expiredKeys);
     }
 
-    // Schedule next alarm if there are still entries to expire
     if (earliestRemaining < Infinity) {
       await this.ctx.storage.setAlarm(Date.now() + earliestRemaining);
     }
@@ -126,4 +193,37 @@ export class IdempotencyStore extends DurableObject {
       await storage.delete(keys);
     }
   }
+
+  /** Schedule alarm at expiresAt if sooner than the current alarm. */
+  private async scheduleAlarm(expiresAt: number): Promise<void> {
+    const currentAlarm = await this.ctx.storage.getAlarm();
+    if (!currentAlarm || expiresAt < currentAlarm) {
+      await this.ctx.storage.setAlarm(expiresAt);
+    }
+  }
+
+  /**
+   * Run storage mutations under blockConcurrencyWhile when available.
+   * Unit-test mocks may omit the method; then the callback runs immediately.
+   */
+  private async withConcurrencyBlock<T>(fn: () => Promise<T>): Promise<T> {
+    const block = (
+      this.ctx as DurableObjectState & {
+        blockConcurrencyWhile?: <U>(cb: () => Promise<U>) => Promise<U>;
+      }
+    ).blockConcurrencyWhile;
+
+    if (typeof block === "function") {
+      return block.call(this.ctx, fn);
+    }
+    return fn();
+  }
+}
+
+/** Resolve expiresAt with fallback for legacy entries that only had storedAt. */
+function entryExpiresAt(entry: StoredEntry | { storedAt: number }): number {
+  if ("expiresAt" in entry && typeof entry.expiresAt === "number") {
+    return entry.expiresAt;
+  }
+  return entry.storedAt + DEFAULT_TTL_MS;
 }

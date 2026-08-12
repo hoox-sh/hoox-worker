@@ -17,13 +17,14 @@ interface __BaseEnv_Env {
 	WEBHOOK_API_KEY_BINDING: string;
 	SAFE_SECRET_1: string;
 	IDEMPOTENCY_STORE: DurableObjectNamespace<import("./src/index").IdempotencyStore>;
+	RATE_LIMITER: DurableObjectNamespace<import("./src/index").RateLimiterStore>;
 	TRADE_SERVICE: Fetcher /* trade-worker */;
 	TELEGRAM_SERVICE: Fetcher /* telegram-worker */;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
 		mainModule: typeof import("./src/index");
-		durableNamespaces: "IdempotencyStore";
+		durableNamespaces: "IdempotencyStore" | "RateLimiterStore";
 	}
 	interface Env extends __BaseEnv_Env {}
 }

@@ -4,17 +4,29 @@
  */
 
 /**
- * Rate limiter with optional KV persistence.
+ * Rate limiter with optional Durable Object (atomic) and KV persistence.
  *
- * Falls back to in-memory Map when KV is unavailable (cold start / local dev).
- * KV-backed mode survives cold starts and shares state across all worker instances.
+ * Priority when checking a key:
+ *   1. Durable Object (`opts.rateLimiter`) — atomic multi-isolate (preferred)
+ *   2. KV namespace — best-effort shared state (last-write-wins under races)
+ *   3. In-memory Map — per-isolate only (local tests / cold-start fallback)
+ *
+ * KV get-then-put cannot guarantee strict limits under concurrent isolates;
+ * use RateLimiterStore DO in production for trade-path MAX_TRADES_PER_MINUTE.
  */
 
-import type { KVNamespace } from "@cloudflare/workers-types";
+import type {
+  DurableObjectNamespace,
+  KVNamespace,
+} from "@cloudflare/workers-types";
+
+import type { RateLimiterStore } from "./rateLimiterStore";
 
 const DEFAULT_MAX_REQUESTS = 10;
 const DEFAULT_WINDOW_SECONDS = 60;
 const KV_PREFIX = "ratelimit:";
+/** Prune expired in-memory entries once the map grows past this size. */
+const MEM_PRUNE_THRESHOLD = 256;
 
 interface RateLimitEntry {
   count: number;
@@ -24,6 +36,11 @@ interface RateLimitEntry {
 export interface RateLimiterConfig {
   maxRequests?: number;
   windowSeconds?: number;
+  /**
+   * Optional RateLimiterStore DO namespace. When set, uses atomic
+   * checkAndIncrement (one DO instance per key via idFromName).
+   */
+  rateLimiter?: DurableObjectNamespace | null;
 }
 
 /**
@@ -31,7 +48,7 @@ export interface RateLimiterConfig {
  *
  * @param kv  — KV namespace (optional; falls back to in-memory Map)
  * @param key — Unique rate limit key (e.g. session ID, API key)
- * @param opts — Optional overrides for maxRequests / windowSeconds
+ * @param opts — Optional overrides for maxRequests / windowSeconds / DO
  * @returns `true` if request is allowed, `false` if rate limited
  */
 export async function checkRateLimit(
@@ -43,6 +60,15 @@ export async function checkRateLimit(
   const windowSeconds = opts.windowSeconds ?? DEFAULT_WINDOW_SECONDS;
   const now = Date.now();
 
+  if (opts.rateLimiter) {
+    return checkDoRateLimit(
+      opts.rateLimiter,
+      key,
+      maxRequests,
+      windowSeconds
+    );
+  }
+
   if (kv) {
     return checkKvRateLimit(kv, key, maxRequests, windowSeconds, now);
   }
@@ -50,9 +76,31 @@ export async function checkRateLimit(
   return checkMemoryRateLimit(key, maxRequests, windowSeconds, now);
 }
 
+// ---- Durable Object (atomic, multi-isolate) ----
+
+async function checkDoRateLimit(
+  ns: DurableObjectNamespace,
+  key: string,
+  maxRequests: number,
+  windowSeconds: number
+): Promise<boolean> {
+  const id = ns.idFromName(key);
+  const stub = ns.get(id) as unknown as RateLimiterStore;
+  return stub.checkAndIncrement(maxRequests, windowSeconds);
+}
+
 // ---- In-memory fallback (per-isolation, resets on cold start) ----
 
 const memMap = new Map<string, RateLimitEntry>();
+
+function pruneMemMap(now: number): void {
+  if (memMap.size < MEM_PRUNE_THRESHOLD) return;
+  for (const [k, entry] of memMap) {
+    if (now > entry.resetAt) {
+      memMap.delete(k);
+    }
+  }
+}
 
 function checkMemoryRateLimit(
   key: string,
@@ -60,6 +108,8 @@ function checkMemoryRateLimit(
   windowSeconds: number,
   now: number
 ): boolean {
+  pruneMemMap(now);
+
   const entry = memMap.get(key);
   if (!entry || now > entry.resetAt) {
     memMap.set(key, { count: 1, resetAt: now + windowSeconds * 1000 });
@@ -70,12 +120,20 @@ function checkMemoryRateLimit(
   return true;
 }
 
-// ---- KV-backed (persistent, shared across instances) ----
+/** Test helper: clear in-memory rate limit state. */
+export function _resetMemoryRateLimiterForTests(): void {
+  memMap.clear();
+}
+
+// ---- KV-backed (persistent, best-effort across instances) ----
 
 /**
  * KV get-then-put rate limiting is best-effort under multi-isolate concurrency
- * (last-write-wins). For strictly atomic limits use a Durable Object.
- * Here we re-check after write and fail closed if we overshot.
+ * (last-write-wins). For strictly atomic limits use RateLimiterStore DO.
+ *
+ * Fail-closed: after write we re-read; if the observed count exceeds max,
+ * reject this request. Concurrent last-slot races can still under-count
+ * slightly — production trade path should bind RATE_LIMITER.
  */
 async function checkKvRateLimit(
   kv: KVNamespace,
@@ -89,7 +147,6 @@ async function checkKvRateLimit(
   const ttlOpts = { expirationTtl: windowSeconds + 5 }; // buffer for clock skew
 
   if (!stored || now > stored.resetAt) {
-    // Fresh window
     const entry: RateLimitEntry = {
       count: 1,
       resetAt: now + windowSeconds * 1000,
@@ -106,8 +163,11 @@ async function checkKvRateLimit(
   };
   await kv.put(kvKey, JSON.stringify(next), ttlOpts);
 
-  // Fail closed on concurrent overshoot: if another isolate also incremented
-  // and we observe a higher count, reject this request.
+  // Fail closed on concurrent overshoot when re-read (or local next) exceeds max.
   if (next.count > maxRequests) return false;
+
+  const after = await kv.get<RateLimitEntry>(kvKey, "json");
+  if (after && after.count > maxRequests) return false;
+
   return true;
 }

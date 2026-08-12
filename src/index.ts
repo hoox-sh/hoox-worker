@@ -16,6 +16,7 @@ import { checkKillSwitch } from "./killSwitch";
 import { checkIpAllowlist } from "./ipAllowlist";
 import { deriveSessionId, getOrCreateSession } from "./sessionManager";
 import { IdempotencyStore } from "./idempotencyStore";
+import { RateLimiterStore } from "./rateLimiterStore";
 import { checkRateLimit as kvRateLimit } from "./rateLimiter";
 import {
   Errors,
@@ -54,7 +55,7 @@ import {
 } from "@hoox-sh/hoox-shared/legal";
 import { createOperatorSseStream } from "./operatorSse";
 
-// --- Rate limiting limits (passed to KV-backed rate limiter) ---
+// --- Rate limiting limits (DO-atomic when RATE_LIMITER bound, else KV/memory) ---
 const MAX_TRADES_PER_MINUTE = 10;
 const RATE_LIMIT_WINDOW = 60; // 60 seconds
 
@@ -181,6 +182,7 @@ router.get(
       trade: env.TRADE_SERVICE ? "configured" : "missing",
       telegram: env.TELEGRAM_SERVICE ? "configured" : "missing",
       idempotency: env.IDEMPOTENCY_STORE ? "configured" : "missing",
+      rateLimiter: env.RATE_LIMITER ? "configured" : "missing",
     };
     return wrapResponse(
       createJsonResponse({
@@ -813,40 +815,74 @@ function idempotencyShardName(key: string): string {
 }
 
 /**
- * Check and store idempotency key using Durable Object.
- * Returns true if the key is new (proceed), false if duplicate.
+ * Resolve the sharded IdempotencyStore stub for a key.
+ * Fail-closed: missing DO throws IDEMPOTENCY_UNAVAILABLE.
+ */
+function getIdempotencyStub(env: Env, key: string): IdempotencyStore {
+  if (!env.IDEMPOTENCY_STORE) {
+    logger.error(
+      "[idempotency] IDEMPOTENCY_STORE missing — refusing trade (fail-closed)"
+    );
+    throw new Error("IDEMPOTENCY_UNAVAILABLE");
+  }
+  const id = env.IDEMPOTENCY_STORE.idFromName(idempotencyShardName(key));
+  return env.IDEMPOTENCY_STORE.get(id) as unknown as IdempotencyStore;
+}
+
+/**
+ * Phase 1: reserve an idempotency key (pending) before queue/service.
+ * Returns true if the key is new (proceed), false if duplicate (in-flight or committed).
  *
  * Fail-closed: missing DO or storage errors refuse the trade (503 path)
  * rather than risking double fills under webhook retries.
  */
-async function checkIdempotency(env: Env, key: string): Promise<boolean> {
-  if (!env.IDEMPOTENCY_STORE) {
-    logger.error(
-      "[checkIdempotency] IDEMPOTENCY_STORE missing — refusing trade (fail-closed)"
-    );
-    throw new Error("IDEMPOTENCY_UNAVAILABLE");
-  }
-
+async function reserveIdempotency(env: Env, key: string): Promise<boolean> {
   try {
-    const id = env.IDEMPOTENCY_STORE.idFromName(idempotencyShardName(key));
-    const stub = env.IDEMPOTENCY_STORE.get(id) as unknown as IdempotencyStore;
-    return await stub.checkAndStore(key);
+    const stub = getIdempotencyStub(env, key);
+    const result = await stub.reserve(key);
+    return result.ok;
   } catch (error) {
-    logger.error("[checkIdempotency] Error:", { error: toError(error) });
-    // Fail closed — a DO outage must not allow duplicate fills
+    logger.error("[reserveIdempotency] Error:", { error: toError(error) });
     throw error instanceof Error ? error : new Error(String(error));
   }
 }
 
 /**
- * Rate limiting delegation — uses KV-backed rate limiter when available,
- * falls back to in-memory (per-isolation, resets on cold start).
+ * Phase 2 success: mark reserved key as committed after queue ack or trade 2xx.
+ * Errors are logged but not rethrown — the trade already succeeded downstream.
+ */
+async function commitIdempotency(env: Env, key: string): Promise<void> {
+  try {
+    const stub = getIdempotencyStub(env, key);
+    await stub.commit(key);
+  } catch (error) {
+    logger.error("[commitIdempotency] Error:", { error: toError(error) });
+  }
+}
+
+/**
+ * Phase 2 hard failure: release reservation so retries can proceed.
+ * Errors are logged but not rethrown — caller already returns an error response.
+ */
+async function releaseIdempotency(env: Env, key: string): Promise<void> {
+  try {
+    const stub = getIdempotencyStub(env, key);
+    await stub.release(key);
+  } catch (error) {
+    logger.error("[releaseIdempotency] Error:", { error: toError(error) });
+  }
+}
+
+/**
+ * Rate limiting delegation — prefers RateLimiterStore DO (atomic multi-isolate)
+ * when RATE_LIMITER is bound; else KV-backed best-effort; else in-memory.
  * Key must be stable across requests (session / apiKey), never a UUID.
  */
 async function checkRateLimit(sessionId: string, env: Env): Promise<boolean> {
   return kvRateLimit(env.CONFIG_KV ?? null, `session:${sessionId}`, {
     maxRequests: MAX_TRADES_PER_MINUTE,
     windowSeconds: RATE_LIMIT_WINDOW,
+    rateLimiter: env.RATE_LIMITER ?? null,
   });
 }
 
@@ -896,13 +932,14 @@ async function processTrade(
   });
   logger.info(`[${requestId}] Queue mode: ${queueMode}`);
 
-  // Check idempotency before processing (client key or auto fingerprint)
+  // Phase 1: reserve idempotency key before any queue/service work.
+  // Pending blocks in-flight retries; commit/release decide the final state.
   const idempotencyKey = resolveIdempotencyKey(tradeData);
-  let isNew: boolean;
+  let reserved: boolean;
   try {
-    isNew = await checkIdempotency(env, idempotencyKey);
+    reserved = await reserveIdempotency(env, idempotencyKey);
   } catch (error: unknown) {
-    const msg = toError(error, "Idempotency check failed");
+    const msg = toError(error, "Idempotency reserve failed");
     logger.error(`[${requestId}] Idempotency unavailable: ${msg}`);
     return {
       success: false,
@@ -911,7 +948,7 @@ async function processTrade(
       status: 503,
     };
   }
-  if (!isNew) {
+  if (!reserved) {
     logger.info(
       `[${requestId}] Duplicate trade detected, rejecting key prefix: ${idempotencyKey.slice(0, 48)}`
     );
@@ -932,6 +969,7 @@ async function processTrade(
     // Use queue mode - send to queue and return success immediately
     try {
       await sendTradeToQueue(env.TRADE_QUEUE, tradeData, idempotencyKey);
+      await commitIdempotency(env, idempotencyKey);
       return {
         success: true,
         requestId,
@@ -949,6 +987,7 @@ async function processTrade(
   // Direct service call (or fallback from queue mode)
   if (!env.TRADE_SERVICE) {
     logger.error(`[${requestId}] TRADE_SERVICE binding is not configured.`);
+    await releaseIdempotency(env, idempotencyKey);
     return {
       success: false,
       requestId,
@@ -976,7 +1015,7 @@ async function processTrade(
     // Fail-closed: never call trade without mesh auth. Prefer TRADE_EXECUTE
     // key, fall back to INTERNAL_KEY_BINDING / AGENT_INTERNAL_KEY.
     // Forward gateway-resolved Idempotency-Key so trade-worker KV shares the
-    // same logical key as the DO check (client key or auto fingerprint).
+    // same logical key as the DO reservation (client key or auto fingerprint).
     const response = await authenticatedServiceFetch(
       env.TRADE_SERVICE,
       env,
@@ -1006,6 +1045,7 @@ async function processTrade(
         );
         try {
           await sendTradeToQueue(env.TRADE_QUEUE, tradeData, idempotencyKey);
+          await commitIdempotency(env, idempotencyKey);
           return {
             success: true,
             requestId,
@@ -1022,12 +1062,16 @@ async function processTrade(
         }
       }
 
+      await releaseIdempotency(env, idempotencyKey);
       return {
         success: false,
         requestId,
         error: `Trade service call failed (${response.status})`,
       };
     }
+
+    // Trade service 2xx — commit before parsing body so retries stay blocked
+    await commitIdempotency(env, idempotencyKey);
 
     // Assuming trade-worker returns a StandardResponse { success: boolean, result?, error? }
     const result: StandardResponse = await response.json();
@@ -1044,6 +1088,7 @@ async function processTrade(
       logger.error(
         `[${requestId}] TRADE_SERVICE auth misconfigured: ${error.message}`
       );
+      await releaseIdempotency(env, idempotencyKey);
       return {
         success: false,
         requestId,
@@ -1063,6 +1108,7 @@ async function processTrade(
       );
       try {
         await sendTradeToQueue(env.TRADE_QUEUE, tradeData, idempotencyKey);
+        await commitIdempotency(env, idempotencyKey);
         return {
           success: true,
           requestId,
@@ -1079,6 +1125,7 @@ async function processTrade(
       }
     }
 
+    await releaseIdempotency(env, idempotencyKey);
     return {
       success: false,
       requestId,
@@ -1189,4 +1236,4 @@ function createDefaultMessage(data: WebhookData): string {
   return message;
 }
 
-export { IdempotencyStore };
+export { IdempotencyStore, RateLimiterStore };
