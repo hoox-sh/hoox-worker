@@ -1,22 +1,22 @@
 {
   "display_name": "Gateway",
-  "description": "Webhook gateway, security, routing, rate limits, and notify allowlist",
+  "description": "Live webhook ingress controls only (settings workers actually read)",
   "sections": {
     "global": {
-      "title": "Global Rules",
-      "description": "Master settings affecting all inbound hooks",
+      "title": "Kill Switch",
+      "description": "OR'd with trade:kill_switch by checkKillSwitch — either trips the breaker",
       "icon": "shield",
       "priority": 10,
       "fields": {
         "kill_switch": false,
       },
       "descriptions": {
-        "kill_switch": "Master kill switch for all webhooks (global:kill_switch). If true, no incoming webhooks are processed by the gateway. trade:kill_switch is the trade-path / agent override.",
+        "kill_switch": "global:kill_switch. Prefer engaging the breaker from Agent / Trade risk UI (trade:kill_switch); this is the gateway-side twin.",
       },
     },
     "webhook": {
-      "title": "TradingView Security",
-      "description": "IP allowlisting, queue mode, and webhook delivery policy",
+      "title": "Webhook Security & Queue",
+      "description": "TradingView IP allowlist and queue delivery mode",
       "icon": "shield",
       "priority": 20,
       "fields": {
@@ -28,41 +28,21 @@
         "queue_mode": ["queue_failover", "queue_everywhere", "queue_disabled"],
       },
       "descriptions": {
-        "tradingview_ip_check_enabled": "Enforce IP validation for incoming TradingView webhooks (webhook:tradingview:ip_check_enabled).",
-        "tradingview_allowed_ips": "JSON array of allowed IP addresses for TradingView webhooks.",
-        "queue_mode": "How the gateway uses Cloudflare Queues: failover (enqueue on trade-worker failure), everywhere (always enqueue), or disabled (service binding only).",
+        "tradingview_ip_check_enabled": "Enforce CF-Connecting-IP allowlist for TradingView webhooks.",
+        "tradingview_allowed_ips": "JSON array of extra allowed IPs (merged with built-in TradingView ranges).",
+        "queue_mode": "queue_failover (default): Service Binding first, queue on failure. queue_everywhere: always enqueue. queue_disabled: binding only.",
       },
     },
     "notify": {
-      "title": "Telegram Notify Allowlist",
-      "description": "Gateway fail-closed chatId allowlist for notify forwarding (union with TELEGRAM_ALLOWED_CHAT_IDS / AUTHORIZED_CHAT_IDS secrets)",
+      "title": "Notify Allowlist",
+      "description": "Gateway fail-closed chatId allowlist (union with TELEGRAM_ALLOWED_CHAT_IDS secret)",
       "icon": "bell",
-      "priority": 25,
+      "priority": 30,
       "fields": {
         "allowed_chat_ids": "[]",
       },
       "descriptions": {
-        "allowed_chat_ids": "JSON array of Telegram chat IDs allowed for gateway notify (telegram:allowed_chat_ids). Empty allowlist + no env secrets → notify rejected (fail-closed). Prefer also setting TELEGRAM_ALLOWED_CHAT_IDS secret via CLI.",
-      },
-    },
-    "routing": {
-      "title": "Routing",
-      "description": "Trade routing configuration",
-      "icon": "router",
-      "priority": 30,
-      "fields": {
-        "default_exchange": "mexc",
-        "failover_enabled": true,
-        "default_leverage": 10,
-      },
-      "options": {
-        "default_exchange": ["binance", "mexc", "bybit"],
-        "default_leverage": [1, 5, 10, 20, 50, 100],
-      },
-      "descriptions": {
-        "default_exchange": "Default exchange for trade execution when not specified in the signal.",
-        "failover_enabled": "Enable automatic failover to secondary exchanges when primary fails.",
-        "default_leverage": "Documented default leverage for signals that omit leverage (trade-worker also has trade:default_leverage).",
+        "allowed_chat_ids": "JSON array written to telegram:allowed_chat_ids. Empty + no env secret → notify rejected. Prefer also: hoox secrets set hoox TELEGRAM_ALLOWED_CHAT_IDS",
       },
     },
   },
