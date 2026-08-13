@@ -1,6 +1,6 @@
 {
   "display_name": "Gateway",
-  "description": "Webhook gateway and routing",
+  "description": "Webhook gateway, security, routing, rate limits, and notify allowlist",
   "sections": {
     "global": {
       "title": "Global Rules",
@@ -11,21 +11,38 @@
         "kill_switch": false,
       },
       "descriptions": {
-        "kill_switch": "Master kill switch for all webhooks. If true, no incoming webhooks are processed by the gateway.",
+        "kill_switch": "Master kill switch for all webhooks (global:kill_switch). If true, no incoming webhooks are processed by the gateway. trade:kill_switch is the trade-path / agent override.",
       },
     },
     "webhook": {
       "title": "TradingView Security",
-      "description": "IP Allowlisting for TradingView",
+      "description": "IP allowlisting, queue mode, and webhook delivery policy",
       "icon": "shield",
       "priority": 20,
       "fields": {
         "tradingview_ip_check_enabled": true,
         "tradingview_allowed_ips": "[\"52.89.214.238\", \"34.212.75.30\", \"54.218.53.128\", \"52.32.178.7\"]",
+        "queue_mode": "queue_failover",
+      },
+      "options": {
+        "queue_mode": ["queue_failover", "queue_everywhere", "queue_disabled"],
       },
       "descriptions": {
-        "tradingview_ip_check_enabled": "Enforce IP validation for incoming TradingView webhooks.",
+        "tradingview_ip_check_enabled": "Enforce IP validation for incoming TradingView webhooks (webhook:tradingview:ip_check_enabled).",
         "tradingview_allowed_ips": "JSON array of allowed IP addresses for TradingView webhooks.",
+        "queue_mode": "How the gateway uses Cloudflare Queues: failover (enqueue on trade-worker failure), everywhere (always enqueue), or disabled (service binding only).",
+      },
+    },
+    "notify": {
+      "title": "Telegram Notify Allowlist",
+      "description": "Gateway fail-closed chatId allowlist for notify forwarding (union with TELEGRAM_ALLOWED_CHAT_IDS / AUTHORIZED_CHAT_IDS secrets)",
+      "icon": "bell",
+      "priority": 25,
+      "fields": {
+        "allowed_chat_ids": "[]",
+      },
+      "descriptions": {
+        "allowed_chat_ids": "JSON array of Telegram chat IDs allowed for gateway notify (telegram:allowed_chat_ids). Empty allowlist + no env secrets → notify rejected (fail-closed). Prefer also setting TELEGRAM_ALLOWED_CHAT_IDS secret via CLI.",
       },
     },
     "routing": {
@@ -45,6 +62,7 @@
       "descriptions": {
         "default_exchange": "Default exchange for trade execution when not specified in the signal.",
         "failover_enabled": "Enable automatic failover to secondary exchanges when primary fails.",
+        "default_leverage": "Documented default leverage for signals that omit leverage (trade-worker also has trade:default_leverage).",
       },
     },
   },
