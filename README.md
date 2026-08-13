@@ -62,6 +62,27 @@ hoox check health                # mesh health including gateway
 bun test workers/hoox-worker
 ```
 
+### Deploy notes (post-hardening)
+
+```bash
+# From workers/hoox-worker (or monorepo root with --config)
+# wrangler deploy applies DO migrations (v1 IdempotencyStore, v2 RateLimiterStore).
+wrangler deploy
+
+# Notify allowlist (fail-closed when unset). Comma-separated numeric chat IDs.
+wrangler secret put TELEGRAM_ALLOWED_CHAT_IDS
+# Optional alias (same shape as telegram-worker):
+# wrangler secret put AUTHORIZED_CHAT_IDS
+```
+
+| Binding / secret | Required | Notes |
+| ---------------- | -------- | ----- |
+| `RATE_LIMITER` → `RateLimiterStore` | **Yes (prod)** | Atomic multi-isolate rate limits for the trade path. Without the binding, gateway falls back to `CONFIG_KV` / in-memory (best-effort). Declared in `wrangler.jsonc` + migration tag `v2`. |
+| `IDEMPOTENCY_STORE` → `IdempotencyStore` | Yes | Migration tag `v1`. |
+| `TELEGRAM_ALLOWED_CHAT_IDS` | **Yes for notify** | Public webhook notify payloads; also `CONFIG_KV` key `telegram:allowed_chat_ids` (JSON array). Alias: `AUTHORIZED_CHAT_IDS`. |
+
+Full post-hardening checklist: [`DEPLOY.md`](./DEPLOY.md).
+
 ### Mesh interconnect
 
 | Direction | Peers |

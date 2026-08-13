@@ -4,10 +4,11 @@ WEBHOOK_API_KEY_BINDING=your_api_secret_key_here
 TRADE_SERVICE=http://localhost:8788
 TELEGRAM_SERVICE=http://localhost:8790
 
-# Notify chatId allowlist (fail-closed when unset). Comma-separated.
+# Notify chatId allowlist (fail-closed when unset). Comma-separated numeric IDs.
 # Also: CONFIG_KV key telegram:allowed_chat_ids as JSON array ["123","-100..."]
+# Align with telegram-worker AUTHORIZED_CHAT_IDS / TG_CHAT_ID_BINDING.
 TELEGRAM_ALLOWED_CHAT_IDS=123456789
-# AUTHORIZED_CHAT_IDS=123456789
+# AUTHORIZED_CHAT_IDS=123456789   # alias (same shape as telegram-worker)
 
 # Note: This file provides example values for local development.
 # Copy this file to .dev.vars and replace with your actual values.
