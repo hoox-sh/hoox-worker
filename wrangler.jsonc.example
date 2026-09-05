@@ -89,15 +89,17 @@
     },
   ],
 
-  // VECTORIZE: AI embeddings index for RAG
-  // Get index_name from Cloudflare Dashboard > Vectorize
-  "vectorize": [
-    {
-      "binding": "VECTORIZE_INDEX",
-      // INDEX_NAME: Your Vectorize index name
-      "index_name": "YOUR_INDEX_NAME",
-    },
-  ],
+  // VECTORIZE: optional — Telegram / gateway RAG.
+  // Leaving YOUR_INDEX_NAME in place makes `wrangler deploy` fail.
+  // Create the index (token needs Vectorize:Edit), then uncomment:
+  //   wrangler vectorize create hoox-rag-index --dimensions=768 --metric=cosine
+  //   hoox infra vectorize create hoox-rag-index --dimensions 768 --metric cosine
+  // "vectorize": [
+  //   {
+  //     "binding": "VECTORIZE_INDEX",
+  //     "index_name": "hoox-rag-index",
+  //   },
+  // ],
 
   // AI: Cloudflare Workers AI for running AI models
   "ai": {
