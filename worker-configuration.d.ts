@@ -20,6 +20,7 @@ interface __BaseEnv_Env {
 	RATE_LIMITER: DurableObjectNamespace<import("./src/index").RateLimiterStore>;
 	TRADE_SERVICE: Fetcher /* trade-worker */;
 	TELEGRAM_SERVICE: Fetcher /* telegram-worker */;
+	WEB3_WALLET_SERVICE: Fetcher /* web3-wallet-worker */;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {

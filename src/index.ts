@@ -53,11 +53,9 @@ import {
   ServiceAuthError,
   TRADE_EXECUTE_AUTH_KEY_FIELDS,
   TELEGRAM_ALERT_AUTH_KEY_FIELDS,
+  WALLET_EXECUTE_AUTH_KEY_FIELDS,
 } from "@hoox-sh/hoox-shared/service-bindings";
-import {
-  DISCLAIMER,
-  DISCLAIMER_HEADER,
-} from "@hoox-sh/hoox-shared/legal";
+import { DISCLAIMER, DISCLAIMER_HEADER } from "@hoox-sh/hoox-shared/legal";
 import { createOperatorSseStream } from "./operatorSse";
 
 // --- Rate limiting limits (DO-atomic when RATE_LIMITER bound, else KV/memory) ---
@@ -190,6 +188,7 @@ router.get(
       queue: env.TRADE_QUEUE ? "configured" : "missing",
       trade: env.TRADE_SERVICE ? "configured" : "missing",
       telegram: env.TELEGRAM_SERVICE ? "configured" : "missing",
+      wallet: env.WEB3_WALLET_SERVICE ? "configured" : "missing",
       idempotency: env.IDEMPOTENCY_STORE ? "configured" : "missing",
       rateLimiter: env.RATE_LIMITER ? "configured" : "missing",
     };
@@ -275,6 +274,122 @@ router.get(
   }
 );
 
+// ─── Wallet proxy (/wallet/*) — operator-auth, explicit allowlist ───────────
+// Forwards DeFi wallet operations to web3-wallet-worker via service binding.
+// Callers authenticate with the operator Bearer key; mesh auth
+// (X-Internal-Auth-Key) is injected here. Idempotency-Key passes through so
+// client retries share one logical key with the wallet worker's D1 replay
+// guard. Only allowlisted upstream paths are forwarded — the shared router
+// has no wildcard support, and an explicit table documents the surface.
+const WALLET_PROXY_PATHS = [
+  "/",
+  "/status",
+  "/config",
+  "/balance",
+  "/transfer",
+  "/approve",
+  "/quote",
+  "/swap",
+  "/transactions",
+] as const;
+
+async function proxyWalletRequest(
+  upstreamPath: string,
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const denied = await requireOperatorAuth(request, env);
+  if (denied) return wrapResponse(denied);
+  if (!env.WEB3_WALLET_SERVICE) {
+    logger.error("WEB3_WALLET_SERVICE binding is not configured.");
+    return wrapResponse(
+      createJsonResponse(
+        { success: false, error: "Web3 wallet service not available." },
+        500
+      )
+    );
+  }
+
+  const url = new URL(request.url);
+  const target = upstreamPath + url.search;
+
+  // Bounded JSON body read (wallet payloads are small documents).
+  let body: unknown = undefined;
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    const parsed = await readJsonBodyWithLimit(request);
+    if (!parsed.ok) {
+      return wrapResponse(
+        createJsonResponse(
+          { success: false, error: parsed.error },
+          parsed.status
+        )
+      );
+    }
+    body = parsed.value;
+  }
+
+  const forwardHeaders: Record<string, string> = {};
+  const idempotencyKey = request.headers.get("Idempotency-Key");
+  if (idempotencyKey) forwardHeaders["Idempotency-Key"] = idempotencyKey;
+
+  let upstream: Response;
+  try {
+    upstream = await authenticatedServiceFetch(
+      env.WEB3_WALLET_SERVICE,
+      env,
+      target,
+      body,
+      {
+        method: request.method,
+        headers: forwardHeaders,
+        timeout: 60_000,
+        internalKeyFields: WALLET_EXECUTE_AUTH_KEY_FIELDS,
+      }
+    );
+  } catch (error: unknown) {
+    if (error instanceof ServiceAuthError) {
+      logger.error(`WEB3_WALLET_SERVICE auth misconfigured: ${error.message}`);
+      return wrapResponse(
+        createJsonResponse(
+          { success: false, error: "Internal authentication not configured." },
+          500
+        )
+      );
+    }
+    const errorMsg = toError(error, "Unknown error calling wallet service");
+    logger.error(`Exception calling WEB3_WALLET_SERVICE: ${errorMsg}`);
+    return wrapResponse(
+      createJsonResponse(
+        { success: false, error: "Web3 wallet service call failed." },
+        502
+      )
+    );
+  }
+
+  // Re-wrap to apply gateway security headers; log upstream errors server-side.
+  const text = await upstream.text();
+  if (!upstream.ok) {
+    logger.error(`Error from WEB3_WALLET_SERVICE: ${upstream.status}`, {
+      upstream: text.slice(0, 500),
+    });
+  }
+  return wrapResponse(
+    new Response(text, {
+      status: upstream.status,
+      headers: { "Content-Type": "application/json" },
+    })
+  );
+}
+
+for (const walletPath of WALLET_PROXY_PATHS) {
+  const gatewayPath = walletPath === "/" ? "/wallet" : `/wallet${walletPath}`;
+  const handler = async (request: Request, env: Env) =>
+    proxyWalletRequest(walletPath, request, env);
+  router.get(gatewayPath, handler);
+  router.post(gatewayPath, handler);
+  router.put(gatewayPath, handler);
+}
+
 /** Legacy unversioned aliases (same auth) for older clients. */
 router.get(
   "/workers",
@@ -326,8 +441,7 @@ async function readJsonBodyWithLimit(
   request: Request,
   maxBytes: number = MAX_JSON_BODY_BYTES
 ): Promise<
-  | { ok: true; value: unknown }
-  | { ok: false; status: number; error: string }
+  { ok: true; value: unknown } | { ok: false; status: number; error: string }
 > {
   const reader = request.body?.getReader();
   if (!reader) {
@@ -544,19 +658,17 @@ async function handleRequest(
         : headerIdempotencyKey || undefined;
 
     // Validate trade + notify first, then run independent I/O in parallel
-    let tradeWork:
-      | {
-          requestId: string;
-          exchange: string;
-          action: WebhookPayload["action"];
-          symbol: string;
-          quantity: number;
-          price?: number;
-          leverage?: number;
-          test?: boolean;
-          idempotencyKey?: string;
-        }
-      | null = null;
+    let tradeWork: {
+      requestId: string;
+      exchange: string;
+      action: WebhookPayload["action"];
+      symbol: string;
+      quantity: number;
+      price?: number;
+      leverage?: number;
+      test?: boolean;
+      idempotencyKey?: string;
+    } | null = null;
     if (hasTradeIntent(data)) {
       // Normalize action case before schema validation
       const normalizedAction =
@@ -857,7 +969,11 @@ function generateIdempotencyKey(
  */
 function resolveIdempotencyKey(tradeData: TradeData): string {
   const provided = tradeData.idempotencyKey?.trim();
-  if (provided && provided.length > 0 && provided.length <= MAX_IDEMPOTENCY_KEY_LEN) {
+  if (
+    provided &&
+    provided.length > 0 &&
+    provided.length <= MAX_IDEMPOTENCY_KEY_LEN
+  ) {
     const mode = tradeData.test === true ? "test" : "live";
     return `idemp:${provided}:${mode}`;
   }

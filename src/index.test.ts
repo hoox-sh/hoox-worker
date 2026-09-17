@@ -1311,3 +1311,88 @@ describe("Hoox Worker - Request ID", () => {
     }
   });
 });
+
+describe("Hoox Worker - Wallet proxy (/wallet/*)", () => {
+  it("rejects unauthenticated wallet proxy calls with 401", async () => {
+    const env = createMockEnv();
+    const req = new Request("https://example.com/wallet/status", {
+      method: "GET",
+    });
+    const res = await webhookReceiver.fetch(
+      req,
+      env as any,
+      createMockContext()
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 500 when WEB3_WALLET_SERVICE is not bound", async () => {
+    const env = createMockEnv();
+    delete (env as any).WEB3_WALLET_SERVICE;
+    const req = new Request("https://example.com/wallet/status", {
+      method: "GET",
+      headers: operatorAuthHeaders(),
+    });
+    const res = await webhookReceiver.fetch(
+      req,
+      env as any,
+      createMockContext()
+    );
+    expect(res.status).toBe(500);
+    const json: any = await res.json();
+    expect(String(json.error)).toMatch(/not available/i);
+  });
+
+  it("proxies operator-authenticated calls and preserves upstream status", async () => {
+    const env = createMockEnv({
+      WALLET_EXECUTE_KEY_BINDING: "test-wallet-key",
+      WEB3_WALLET_SERVICE: {
+        fetch: mock(async (url: string | URL | Request, init?: RequestInit) => {
+          const target = String(url);
+          expect(target).toContain("/swap");
+          expect(init?.headers).toMatchObject({
+            "X-Internal-Auth-Key": "test-wallet-key",
+            "Idempotency-Key": "key-123",
+          });
+          return new Response(
+            JSON.stringify({ txHash: "0xabc", id: "key-123" }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }),
+      },
+    });
+    const req = new Request("https://example.com/wallet/swap", {
+      method: "POST",
+      headers: {
+        ...operatorAuthHeaders(),
+        "Content-Type": "application/json",
+        "Idempotency-Key": "key-123",
+      },
+      body: JSON.stringify({ chain: "ethereum" }),
+    });
+    const res = await webhookReceiver.fetch(
+      req,
+      env as any,
+      createMockContext()
+    );
+    expect(res.status).toBe(200);
+    const json: any = await res.json();
+    expect(json.txHash).toBe("0xabc");
+  });
+
+  it("returns 404 for wallet paths outside the allowlist", async () => {
+    const env = createMockEnv({
+      WEB3_WALLET_SERVICE: createMockServiceBinding(),
+    });
+    const req = new Request("https://example.com/wallet/nope", {
+      method: "GET",
+      headers: operatorAuthHeaders(),
+    });
+    const res = await webhookReceiver.fetch(
+      req,
+      env as any,
+      createMockContext()
+    );
+    expect(res.status).toBe(404);
+  });
+});
