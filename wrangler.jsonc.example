@@ -92,12 +92,13 @@
   // VECTORIZE: optional — Telegram / gateway RAG.
   // Leaving YOUR_INDEX_NAME in place makes `wrangler deploy` fail.
   // Create the index (token needs Vectorize:Edit), then uncomment:
-  //   wrangler vectorize create hoox-rag-index --dimensions=768 --metric=cosine
-  //   hoox infra vectorize create hoox-rag-index --dimensions 768 --metric cosine
+  //   wrangler vectorize create my-rag-index --dimensions=768 --metric=cosine
+  //   hoox infra vectorize create my-rag-index --dimensions 768 --metric cosine
+  // Embeddings are @cf/baai/bge-base-en-v1.5 (768-d). Do not create a 1536-d index.
   // "vectorize": [
   //   {
   //     "binding": "VECTORIZE_INDEX",
-  //     "index_name": "hoox-rag-index",
+  //     "index_name": "my-rag-index",
   //   },
   // ],
 
