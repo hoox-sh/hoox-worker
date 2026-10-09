@@ -31,6 +31,7 @@ import {
   createLogger,
   withRequestLog,
   validateJson,
+  // COMMERCIAL HOOK: verifyTenant (hx_live) plugs in here — open self-host path unchanged
   requireOperatorAuth,
   timingSafeEqual,
   safeWaitUntil,
