@@ -27,11 +27,12 @@ import {
   toError,
   createJsonResponse,
 } from "@hoox-sh/hoox-shared/errors";
+// COMMERCIAL HOOK (see OPEN_CORE_FEATURE_SPLIT.md): verifyTenant (hx_live)
+// plugs in here — open self-host path unchanged.
 import {
   createLogger,
   withRequestLog,
   validateJson,
-  // COMMERCIAL HOOK: verifyTenant (hx_live) plugs in here — open self-host path unchanged
   requireOperatorAuth,
   timingSafeEqual,
   safeWaitUntil,
