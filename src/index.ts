@@ -338,13 +338,20 @@ async function proxyWalletRequest(
   const idempotencyKey = request.headers.get("Idempotency-Key");
   if (idempotencyKey) forwardHeaders["Idempotency-Key"] = idempotencyKey;
 
+  // Forward the tenant in proxied wallet bodies so a shared web3 upload can
+  // attribute (identity when TENANT_MODE is off; non-object bodies pass through).
+  const forwardBody =
+    body !== null && typeof body === "object" && !Array.isArray(body)
+      ? withTenantId(env, body as Record<string, unknown>)
+      : body;
+
   let upstream: Response;
   try {
     upstream = await authenticatedServiceFetch(
       env.WEB3_WALLET_SERVICE,
       env,
       target,
-      body,
+      forwardBody,
       {
         method: request.method,
         headers: forwardHeaders,
@@ -1378,14 +1385,15 @@ async function processNotification(
     };
   }
   try {
-    // Construct the payload expected by telegram-worker's /process endpoint
-    const payload = {
+    // Construct the payload expected by telegram-worker's /process endpoint.
+    // Forward the tenant for shared-upload attribution (identity when off).
+    const payload = withTenantId(env, {
       requestId: requestId,
       payload: {
         message: message,
         chatId: chatId,
       },
-    };
+    });
 
     logger.info(`[${requestId}] Calling TELEGRAM_SERVICE service binding...`);
     const response = await authenticatedServiceFetch(
