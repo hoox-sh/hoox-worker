@@ -49,6 +49,7 @@ import {
   trackAnalytics,
   type AnalyticsEnv,
 } from "@hoox-sh/hoox-shared/analytics";
+import { scopeKey, withTenantId } from "@hoox-sh/hoox-shared/tenant";
 import { KVKeys } from "@hoox-sh/hoox-shared/kvKeys";
 import {
   authenticatedServiceFetch,
@@ -79,6 +80,9 @@ const MAX_IDEMPOTENCY_KEY_LEN = 256;
 type Env = Cloudflare.Env &
   ChatIdAllowlistEnv & {
     OPERATOR_API_KEY?: string;
+    /** Opt-in tenant isolation (see @hoox-sh/hoox-shared/tenant). Absent = self-host default. */
+    TENANT_ID?: string;
+    TENANT_MODE?: string;
   };
 
 // --- Other interfaces (WebhookData, TradeData, etc.) remain the same ---
@@ -1010,7 +1014,11 @@ function getIdempotencyStub(env: Env, key: string): IdempotencyStore {
     );
     throw new Error("IDEMPOTENCY_UNAVAILABLE");
   }
-  const id = env.IDEMPOTENCY_STORE.idFromName(idempotencyShardName(key));
+  // Opt-in tenant isolation: shard names are tenant-scoped when TENANT_MODE
+  // is on, identity otherwise (self-host default).
+  const id = env.IDEMPOTENCY_STORE.idFromName(
+    scopeKey(env, idempotencyShardName(key))
+  );
   return env.IDEMPOTENCY_STORE.get(id) as unknown as IdempotencyStore;
 }
 
@@ -1023,6 +1031,8 @@ function getIdempotencyStub(env: Env, key: string): IdempotencyStore {
  */
 async function reserveIdempotency(env: Env, key: string): Promise<boolean> {
   try {
+    // Shard is tenant-scoped inside getIdempotencyStub; the raw key is
+    // stored within that tenant's shard set.
     const stub = getIdempotencyStub(env, key);
     const result = await stub.reserve(key);
     return result.ok;
@@ -1065,7 +1075,10 @@ async function releaseIdempotency(env: Env, key: string): Promise<void> {
  * Key must be stable across requests (session / apiKey), never a UUID.
  */
 async function checkRateLimit(sessionId: string, env: Env): Promise<boolean> {
-  return kvRateLimit(env.CONFIG_KV ?? null, `session:${sessionId}`, {
+  // Opt-in tenant isolation: session buckets are tenant-scoped when
+  // TENANT_MODE is on, shared otherwise (self-host default).
+  const bucket = scopeKey(env, `session:${sessionId}`);
+  return kvRateLimit(env.CONFIG_KV ?? null, bucket, {
     maxRequests: MAX_TRADES_PER_MINUTE,
     windowSeconds: RATE_LIMIT_WINDOW,
     rateLimiter: env.RATE_LIMITER ?? null,
@@ -1075,13 +1088,15 @@ async function checkRateLimit(sessionId: string, env: Env): Promise<boolean> {
 /**
  * Send trade to queue for async processing.
  * Passes the gateway-resolved idempotency key so trade-worker KV aligns with DO.
+ * Attaches `tenantId` when TENANT_MODE is on (shared queue consumer path).
  */
 async function sendTradeToQueue(
   queue: Queue,
   tradeData: TradeData,
-  idempotencyKey?: string
+  idempotencyKey?: string,
+  env?: Env
 ): Promise<void> {
-  const message = {
+  const message = withTenantId(env ?? {}, {
     requestId: tradeData.requestId,
     exchange: tradeData.exchange,
     action: tradeData.action,
@@ -1092,7 +1107,7 @@ async function sendTradeToQueue(
     test: tradeData.test,
     ...(idempotencyKey ? { idempotencyKey } : {}),
     queuedAt: new Date().toISOString(),
-  };
+  });
   await queue.send(message);
   logger.info(`[${tradeData.requestId}] Trade sent to queue`);
 }
@@ -1154,7 +1169,7 @@ async function processTrade(
   if (useQueue && env.TRADE_QUEUE) {
     // Use queue mode - send to queue and return success immediately
     try {
-      await sendTradeToQueue(env.TRADE_QUEUE, tradeData, idempotencyKey);
+      await sendTradeToQueue(env.TRADE_QUEUE, tradeData, idempotencyKey, env);
       await commitIdempotency(env, idempotencyKey);
       return {
         success: true,
@@ -1183,7 +1198,7 @@ async function processTrade(
 
   try {
     // Construct the payload expected by trade-worker's /webhook endpoint
-    const tradeWorkerPayload: WebhookPayload = {
+    const tradeWorkerPayload: WebhookPayload = withTenantId(env, {
       exchange: exchange,
       // Ensure action matches the expected enum in trade-worker (LONG, SHORT, etc.)
       action: action.toUpperCase() as WebhookPayload["action"],
@@ -1192,7 +1207,7 @@ async function processTrade(
       price: price,
       leverage: leverage,
       test: test,
-    };
+    });
 
     logger.info(
       `[${requestId}] Calling TRADE_SERVICE service binding with payload`,
@@ -1230,7 +1245,12 @@ async function processTrade(
           `[${requestId}] Direct call failed, attempting queue fallback...`
         );
         try {
-          await sendTradeToQueue(env.TRADE_QUEUE, tradeData, idempotencyKey);
+          await sendTradeToQueue(
+            env.TRADE_QUEUE,
+            tradeData,
+            idempotencyKey,
+            env
+          );
           await commitIdempotency(env, idempotencyKey);
           return {
             success: true,
@@ -1310,7 +1330,7 @@ async function processTrade(
         `[${requestId}] Direct call exception, attempting queue fallback...`
       );
       try {
-        await sendTradeToQueue(env.TRADE_QUEUE, tradeData, idempotencyKey);
+        await sendTradeToQueue(env.TRADE_QUEUE, tradeData, idempotencyKey, env);
         await commitIdempotency(env, idempotencyKey);
         return {
           success: true,
